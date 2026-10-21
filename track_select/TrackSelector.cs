@@ -9,10 +9,13 @@
 // which runs after this), and camera followers aimed at a "Camera Target".
 // No -track argument leaves the scene untouched (Porto). Re-applied when the scene reloads
 // (the in-sim Reset button reloads it). Log lines start with [TrackSelect] in Player.log.
+// Switch() changes the track while the sim runs (Map button, control port; SimControl.cs): the car
+// goes to the new track's start pose, which also becomes ResetManager's reset pose.
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -30,7 +33,11 @@ namespace TrackSelect
     public static class TrackSelector
     {
         const string Tag = "[TrackSelect] ";
-        static string requested;
+        static string requested;   // applied on every scene load; null: the scene as built (Porto)
+
+        // display names ("Porto", "IROS 2026", ...) of the tracks in the scene, and the active one
+        public static List<string> Tracks { get; private set; } = new List<string>();
+        public static string Current { get; private set; }
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
         public static void Init()
@@ -38,11 +45,11 @@ namespace TrackSelect
             string[] args = Environment.GetCommandLineArgs();
             for (int i = 0; i < args.Length - 1; i++)
                 if (args[i].ToLower() == "-track") requested = args[i + 1];
-            if (requested == null) return;
             SceneManager.sceneLoaded += (scene, mode) => Apply();
+            SimControl.Init();   // registers its own sceneLoaded handler after this one
         }
 
-        static string Key(string s) => new string(s.ToLower().Where(char.IsLetterOrDigit).ToArray());
+        public static string Key(string s) => new string(s.ToLower().Where(char.IsLetterOrDigit).ToArray());
 
         static Transform Child(Transform parent, string name)
         {
@@ -56,23 +63,70 @@ namespace TrackSelect
             catch (Exception e) { Debug.LogError(Tag + e); }
         }
 
-        static void ApplyUnsafe()
+        static Transform Infrastructure()
         {
             GameObject infraGo = SceneManager.GetActiveScene().GetRootGameObjects().FirstOrDefault(g => g.name == "Infrastructure");
-            if (infraGo == null) { Debug.LogError(Tag + "no Infrastructure object"); return; }
-            Transform infra = infraGo.transform;
+            if (infraGo == null) Debug.LogError(Tag + "no Infrastructure object");
+            return infraGo == null ? null : infraGo.transform;
+        }
 
+        static void ApplyUnsafe()
+        {
+            Transform infra = Infrastructure();
+            if (infra == null) return;
             LoadCustomTracks(infra);
             // prefix ("Porto", "SRL 2024 IROS", "IROS 2026", ...) of every "<prefix> Track"
-            var prefixes = new List<string>();
+            Tracks = new List<string>();
             foreach (Transform t in infra)
-                if (t.name.EndsWith(" Track")) prefixes.Add(t.name.Substring(0, t.name.Length - " Track".Length));
-            string chosen = prefixes.FirstOrDefault(p => Key(p) == Key(requested));
+                if (t.name.EndsWith(" Track")) Tracks.Add(t.name.Substring(0, t.name.Length - " Track".Length));
+            Current = Tracks.FirstOrDefault(p => Child(infra, p + " Track").gameObject.activeSelf);
+            if (requested != null) Select(infra, requested);
+        }
+
+        /// <summary>Switch to track `name` while the sim runs: the car is reset at its start pose.
+        /// Returns the display name, or null if there is no such track.</summary>
+        public static string Switch(string name)
+        {
+            Transform infra = Infrastructure();
+            string chosen = infra == null ? null : Select(infra, name);
+            if (chosen == null) return null;
+            requested = chosen;   // also after the scene reloads (in-sim Reset)
+            // ResetManager recorded the start pose in Start(); make the new spawn the reset pose and
+            // reset now (lap timer, encoders and collisions back to their start values too). Its reset runs
+            // in its private Update when ResetFlag is set; call it here: a Bridge message in the next fixed
+            // step can overwrite the flag (Socket.OnBridge sets it from "V1 Reset" in Autonomous).
+            FieldInfo pos = typeof(ResetManager).GetField("init_VehiclePositions", BindingFlags.NonPublic | BindingFlags.Instance);
+            FieldInfo rot = typeof(ResetManager).GetField("init_VehicleRotations", BindingFlags.NonPublic | BindingFlags.Instance);
+            MethodInfo reset = typeof(ResetManager).GetMethod("Update", BindingFlags.NonPublic | BindingFlags.Instance);
+            foreach (ResetManager rm in UnityEngine.Object.FindObjectsOfType<ResetManager>(true))
+            {
+                var p = (Vector3[])pos.GetValue(rm);
+                var r = (Quaternion[])rot.GetValue(rm);
+                if (p == null || r == null) continue;   // Start() has not run yet: it records the new pose itself
+                for (int i = 0; i < rm.Vehicles.Length && i < p.Length; i++)
+                {
+                    p[i] = rm.Vehicles[i].position;
+                    r[i] = rm.Vehicles[i].rotation;
+                }
+                rm.ResetFlag = true;
+                if (!rm.isActiveAndEnabled) continue;   // as in the sim: its Update runs only when active
+                // the track has switched already: log a failed reset, still report the switch
+                try { reset.Invoke(rm, null); }
+                catch (TargetInvocationException e) { Debug.LogError(Tag + "reset after the switch: " + e.InnerException); }
+            }
+            return chosen;
+        }
+
+        // Enable track `name` (and only it), point LapTimer, the car and the cameras at it.
+        static string Select(Transform infra, string name)
+        {
+            List<string> prefixes = Tracks;
+            string chosen = prefixes.FirstOrDefault(p => Key(p) == Key(name));
             if (chosen == null)
             {
-                Debug.LogError(Tag + $"unknown track '{requested}'. Available: " +
+                Debug.LogError(Tag + $"unknown track '{name}'. Available: " +
                                string.Join(", ", prefixes.Select(p => Key(p))));
-                return;
+                return null;
             }
             foreach (string p in prefixes)
                 foreach (string suffix in new[] { " Track", " Checkpoints", " Spawn Points", " Camera Target" })
@@ -91,13 +145,19 @@ namespace TrackSelect
                 lt.Checkpoints = numbered;
                 lt.transform.SetPositionAndRotation(spawn.position, spawn.rotation);
                 Rigidbody rb = lt.GetComponent<Rigidbody>();
-                if (rb != null) { rb.position = spawn.position; rb.rotation = spawn.rotation; }
+                if (rb != null)
+                {
+                    rb.position = spawn.position; rb.rotation = spawn.rotation;
+                    if (!rb.isKinematic) { rb.velocity = Vector3.zero; rb.angularVelocity = Vector3.zero; }
+                }
             }
             Transform camTarget = Child(infra, chosen + " Camera Target");
             if (camTarget != null)   // e.g. Trackcam's TrackTarget
                 foreach (var f in UnityEngine.Object.FindObjectsOfType<AbstractTargetFollower>(true))
                     if (f.Target != null && f.Target.name.EndsWith(" Camera Target")) f.SetTarget(camTarget);
+            Current = chosen;
             Debug.Log(Tag + $"track '{chosen}': {numbered.Length} checkpoints, spawn {spawn.position}");
+            return chosen;
         }
 
         // ------------------------------------------------------------ custom tracks

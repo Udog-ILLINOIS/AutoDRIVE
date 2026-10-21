@@ -22,8 +22,9 @@ export: writes tracks/<name>/mesh.bin (Porto-style duct mesh) and track.json (ch
   along the centerline of global_waypoints.json, spawn at the map's initial_pose). The plugin
   builds the track at startup by cloning Porto's objects. The map frame is the sim's world frame
   (ROS x = Unity z, ROS y = -Unity x), so ForzaETH needs no localization offset.
-app: copies the stock app, adds TrackSelect.dll (built with ~/.dotnet) and every tracks/<name>/,
-  and signs the copy ad hoc. The stock app's own data files are not modified.
+app: copies the stock app, adds TrackSelect.dll (built with ~/.dotnet; TrackSelector.cs + SimControl.cs:
+  -autoconnect, control port, Map row in the Menu panel) and every tracks/<name>/, and signs the copy
+  ad hoc. The stock app's own data files are not modified.
 """
 import argparse
 import json
@@ -315,7 +316,8 @@ def cmd_app(a):
     json.dump(ri, open(ri_path, 'w'))
     tracks = sorted(d for d in os.listdir(a.tracks) if os.path.isfile(os.path.join(a.tracks, d, 'track.json')))
     for t in tracks:
-        shutil.copytree(os.path.join(a.tracks, t), os.path.join(data, 'StreamingAssets', 'tracks', t))
+        shutil.copytree(os.path.join(a.tracks, t), os.path.join(data, 'StreamingAssets', 'tracks', t),
+                        dirs_exist_ok=True)   # src may be an earlier multi-track build
     subprocess.run(['xattr', '-cr', app], check=False)
     subprocess.run(['codesign', '--force', '--deep', '-s', '-', app], check=True, stderr=subprocess.DEVNULL)
     if os.path.exists(a.dst):
