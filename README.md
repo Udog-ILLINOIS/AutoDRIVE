@@ -23,9 +23,8 @@ The stock app's own data files are not modified: the plugin is loaded next to th
 > - Built and tested on the **macOS practice build** of release
 >   [`2026-iros`](https://github.com/AutoDRIVE-Ecosystem/AutoDRIVE-RoboRacer-Sim-Racing/releases/tag/2026-iros).
 >   The plugin targets that build's assemblies. Other platforms and builds have not been tried.
-> - The prebuilt release [`f1tenth_multitrack_v1`](https://github.com/Udog-ILLINOIS/AutoDRIVE/releases/tag/f1tenth_multitrack_v1)
->   has track selection only. Autoconnect, the control port and the Map button (commit `ccc6e9f`) need a
->   rebuild until a v2 release is published.
+> - Prebuilt app: release [`f1tenth_multitrack_v2`](https://github.com/Udog-ILLINOIS/AutoDRIVE/releases/tag/f1tenth_multitrack_v2)
+>   (all features, built from `094f9d5`). The older `f1tenth_multitrack_v1` has track selection only.
 
 ## Features
 
@@ -52,7 +51,8 @@ An unknown name logs the available list in `Player.log` (lines starting with `[T
 
 ## Installation
 
-Download the prebuilt app from this fork's [Releases](https://github.com/Udog-ILLINOIS/AutoDRIVE/releases)
+Download `autodrive_simulator_multitrack_macos.zip` from release
+[`f1tenth_multitrack_v2`](https://github.com/Udog-ILLINOIS/AutoDRIVE/releases/tag/f1tenth_multitrack_v2)
 and unzip it. If macOS refuses to open it:
 
 ```bash
