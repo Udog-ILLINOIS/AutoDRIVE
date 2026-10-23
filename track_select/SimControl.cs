@@ -8,12 +8,14 @@
 // Control port: one command per TCP connection, one line in, one JSON line out, e.g.
 //   printf 'status\n' | nc 127.0.0.1 4580        (./autodrive.sh ctl status)
 //   status | tracks | track <name> | connect [ip [port]] | disconnect | reconnect | kick
-//   | click <button> | screenshot [path] | tree [^]<object> [depth] | clickat <x> <y>
+//   | click <button> | screenshot [path] | tree [^]<object> [depth] | bounds <object> | livery
+//   | clickat <x> <y>
 // click <button> is the way to press the sim's buttons: the pointer events of a mouse click, sent to
 // the visible object with that name (Menu, "Driving Mode", Map, "Map Porto", "Scene Reset", ...). It
 // does not move the real mouse. clickat sends them to whatever UI is drawn at x, y (0-1 of the window,
 // from its top left): only for checking the layout, since positions change with the window size and scaling.
-// screenshot saves only the sim's own picture.
+// screenshot saves only the sim's own picture. bounds lists the meshes under an object with their
+// box in its root object's frame (to place a decal, Livery.cs); livery re-reads livery.json.
 // Car back to its start pose: the bridge's /autodrive/reset_command (Autonomous only; also zeroes the
 // command), or track <current track> (any mode, no bridge needed; the bridge does not see it).
 // Scene Reset reloads the whole scene.
@@ -256,10 +258,39 @@ namespace TrackSelect
                         Tree(root, 0, depth, sb);
                         return Json(true, "tree", sb.ToString());
                     }
+                case "bounds":   // bounds <object name>: each mesh under it, its box in the root object's frame
+                    {
+                        if (w.Length < 2) return Json(false, "error", "usage: bounds <object name>");
+                        string name = string.Join(" ", w.Skip(1));
+                        Transform root = Resources.FindObjectsOfTypeAll<Transform>()
+                            .FirstOrDefault(t => t.name == name && t.gameObject.scene.isLoaded);
+                        if (root == null) return Json(false, "error", "no object named " + name);
+                        var sb = new StringBuilder();
+                        Transform frame = root.root;
+                        sb.Append($"{root.name}: pos={frame.InverseTransformPoint(root.position):F3} " +
+                                  $"rot={(Quaternion.Inverse(frame.rotation) * root.rotation).eulerAngles:F1} in {frame.name}\n");
+                        foreach (MeshFilter mf in root.GetComponentsInChildren<MeshFilter>(true))
+                        {
+                            if (mf.sharedMesh == null) continue;
+                            Bounds b = mf.sharedMesh.bounds;
+                            Vector3 lo = Vector3.positiveInfinity, hi = Vector3.negativeInfinity;
+                            for (int i = 0; i < 8; i++)
+                            {
+                                var c = new Vector3((i & 1) == 0 ? b.min.x : b.max.x, (i & 2) == 0 ? b.min.y : b.max.y,
+                                                    (i & 4) == 0 ? b.min.z : b.max.z);
+                                Vector3 p = frame.InverseTransformPoint(mf.transform.TransformPoint(c));
+                                lo = Vector3.Min(lo, p); hi = Vector3.Max(hi, p);
+                            }
+                            sb.Append($"{mf.name}: min={lo:F3} max={hi:F3}\n");
+                        }
+                        return Json(true, "bounds", sb.ToString());
+                    }
+                case "livery": return Json(true, "result", Livery.Apply());
                 default:
                     return Json(false, "error", "commands: status, tracks, track <name>, connect [ip [port]], " +
                                                 "disconnect, reconnect, kick, click <button>, screenshot [path], " +
-                                                "tree [^]<object> [depth], clickat <x> <y> (layout checks only)");
+                                                "tree [^]<object> [depth], bounds <object>, livery, " +
+                                                "clickat <x> <y> (layout checks only)");
             }
         }
 

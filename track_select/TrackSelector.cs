@@ -47,6 +47,7 @@ namespace TrackSelect
                 if (args[i].ToLower() == "-track") requested = args[i + 1];
             SceneManager.sceneLoaded += (scene, mode) => Apply();
             SimControl.Init();   // registers its own sceneLoaded handler after this one
+            Livery.Init();
         }
 
         public static string Key(string s) => new string(s.ToLower().Where(char.IsLetterOrDigit).ToArray());

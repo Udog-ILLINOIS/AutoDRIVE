@@ -35,6 +35,7 @@ The stock app's own data files are not modified: the plugin is loaded next to th
 | **Custom tracks** | `build_track.py` turns a drawn track map into sim walls, checkpoints and a spawn pose, plus a matching ROS map. Included: `iros2026`. |
 | **Autoconnect** | `-autoconnect` keeps the sim connected to the bridge and reconnects after bridge restarts, without clicking **Connect**. It works around the stock Socket.IO client, which retries without pause when no bridge answers (leaking a socket each time and flooding `Player.log`). |
 | **Safe disconnect** | When the connection drops, the car's throttle and steering are zeroed, so a dead bridge does not leave the car driving on its last command. |
+| **Car livery** | Decals on the car from `livery/livery.json` (pose in the car's frame, a PNG each). Included: the SIGRobotics logo on the rear fin. |
 | **Control port** | A TCP control port on 127.0.0.1:4580 with JSON replies: status, track switching, connect/disconnect, pressing UI buttons by name, screenshots of the sim window. |
 
 ## Tracks
@@ -96,6 +97,8 @@ printf 'status\n' | nc 127.0.0.1 4580       # or: ./autodrive.sh ctl status
 | `click <button>` | press a visible UI button by name, e.g. `Menu`, `"Driving Mode"`, `Map`, `"Map Porto"`, `"Scene Reset"`. It sends a mouse click's pointer events and does not move the real mouse. |
 | `screenshot [path]` | PNG of the sim's own picture, no other windows |
 | `tree [^]<object> [depth]` | scene hierarchy under an object (`^`: its parent); lists button names |
+| `bounds <object>` | each mesh under an object, as a box in the car's (root object's) frame; for placing a decal |
+| `livery` | re-read `livery.json` and replace the car's decals, without restarting |
 | `clickat <x> <y>` | click by position (0-1 of the window). Positions change with window size and scaling, so use it only to check the layout. |
 
 To put the car back at its start pose:
@@ -138,7 +141,7 @@ venv/bin/python build_track.py app "<stock>/AutoDRIVE Simulator.app" "<out>/Auto
 ```
 
 `app` builds `TrackSelect.dll` against the stock app's own `Managed/` assemblies and registers it with
-the player. It copies in every `tracks/<name>/`, then signs the copy ad hoc. The source can also be an
+the player. It copies in `livery/` and every `tracks/<name>/`, then signs the copy ad hoc. The source can also be an
 earlier multi-track build: its plugin and tracks are replaced.
 
 ## Repository layout
@@ -148,7 +151,9 @@ This is the `f1tenth_multitrack` branch of our fork of [Tinker-Twins/AutoDRIVE](
 ```
 track_select/TrackSelector.cs    -track, built-in and custom tracks, switching while running
 track_select/SimControl.cs       -autoconnect, control port, Map row in the Menu panel
+track_select/Livery.cs           decals on the car from livery/livery.json
 track_select/TrackSelect.csproj  plugin project, built against the stock app's assemblies
+livery/                          livery.json (decal poses, car frame: x right, y up, z forward) + images
 tracks/<name>/                   custom tracks: mesh.bin (wall mesh) + track.json (checkpoints, spawns, camera)
 build_track.py                   walls | export | app
 requirements.txt                 Python dependencies of build_track.py
