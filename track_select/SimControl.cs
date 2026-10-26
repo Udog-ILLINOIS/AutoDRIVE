@@ -9,7 +9,7 @@
 //   printf 'status\n' | nc 127.0.0.1 4580        (./autodrive.sh ctl status)
 //   status | tracks | track <name> | connect [ip [port]] | disconnect | reconnect | kick
 //   | click <button> | screenshot [path] | tree [^]<object> [depth] | bounds <object> | livery
-//   | clickat <x> <y>
+//   | obstacle <x> <y> [size] | obstacle clear | clickat <x> <y>
 // click <button> is the way to press the sim's buttons: the pointer events of a mouse click, sent to
 // the visible object with that name (Menu, "Driving Mode", Map, "Map Porto", "Scene Reset", ...). It
 // does not move the real mouse. clickat sends them to whatever UI is drawn at x, y (0-1 of the window,
@@ -286,12 +286,60 @@ namespace TrackSelect
                         return Json(true, "bounds", sb.ToString());
                     }
                 case "livery": return Json(true, "result", Livery.Apply());
+                case "obstacle":   // obstacle <x> <y> [size] | obstacle clear: a box at ROS world x, y
+                    {
+                        if (w.Length == 2 && w[1].ToLower() == "clear") return Json(true, "result", ClearObstacles());
+                        if (w.Length < 3 || !float.TryParse(w[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float ox)
+                                         || !float.TryParse(w[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float oy))
+                            return Json(false, "error", "usage: obstacle <x> <y> [size] | obstacle clear   (ROS world frame, m)");
+                        float size = 0.3f;
+                        if (w.Length > 3 && !float.TryParse(w[3], NumberStyles.Float, CultureInfo.InvariantCulture, out size))
+                            return Json(false, "error", "size must be a number (m)");
+                        return Json(true, "result", PlaceObstacle(ox, oy, size));
+                    }
                 default:
                     return Json(false, "error", "commands: status, tracks, track <name>, connect [ip [port]], " +
                                                 "disconnect, reconnect, kick, click <button>, screenshot [path], " +
                                                 "tree [^]<object> [depth], bounds <object>, livery, " +
+                                                "obstacle <x> <y> [size] | obstacle clear, " +
                                                 "clickat <x> <y> (layout checks only)");
             }
+        }
+
+        // Obstacles: boxes the track did not have when it was mapped. Same layer and material as the active
+        // track's walls, so the lidar sees them and the car collides with them. Gone after a Scene Reset.
+        const string ObstacleName = "SimControl Obstacle";
+
+        static string PlaceObstacle(float x, float y, float size)
+        {
+            var at = new Vector3(-y, 0f, x);   // ROS x = Unity z, ROS y = -Unity x
+            Transform track = Resources.FindObjectsOfTypeAll<Transform>()
+                .FirstOrDefault(t => t.name == TrackSelector.Current + " Track" && t.gameObject.scene.isLoaded);
+            Collider wall = track == null ? null : track.GetComponentInChildren<Collider>(true);
+            // ground: the highest surface straight below
+            float ground = 0f;
+            RaycastHit[] hits = Physics.RaycastAll(at + Vector3.up * 50f, Vector3.down, 100f);
+            if (hits.Length > 0) ground = hits.OrderBy(h => h.distance).First().point.y;
+            GameObject box = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            box.name = ObstacleName;
+            box.transform.localScale = new Vector3(size, 0.4f, size);
+            box.transform.position = new Vector3(at.x, ground + 0.2f, at.z);
+            if (wall != null)
+            {
+                box.layer = wall.gameObject.layer;
+                Renderer wr = wall.GetComponent<Renderer>();
+                if (wr != null) box.GetComponent<Renderer>().sharedMaterial = wr.sharedMaterial;
+            }
+            Debug.Log(Tag + $"obstacle at ROS ({x:0.00}, {y:0.00}), {size:0.00} m, ground {ground:0.00}, layer {box.layer}");
+            return $"obstacle at ({x:0.00}, {y:0.00}), {size:0.00} m box, ground y {ground:0.00}, layer {LayerMask.LayerToName(box.layer)}";
+        }
+
+        static string ClearObstacles()
+        {
+            GameObject[] boxes = Resources.FindObjectsOfTypeAll<GameObject>()
+                .Where(g => g.name == ObstacleName && g.scene.isLoaded).ToArray();
+            foreach (GameObject g in boxes) Destroy(g);
+            return $"removed {boxes.Length} obstacle(s)";
         }
 
         string Status()
