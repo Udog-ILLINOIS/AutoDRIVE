@@ -308,7 +308,7 @@ namespace TrackSelect
 
         // Obstacles: boxes the track did not have when it was mapped. Same layer and material as the active
         // track's walls, so the lidar sees them and the car collides with them. Gone after a Scene Reset.
-        const string ObstacleName = "SimControl Obstacle";
+        internal const string ObstacleName = "SimControl Obstacle";   // MapView draws them too
 
         static string PlaceObstacle(float x, float y, float size)
         {
@@ -330,6 +330,7 @@ namespace TrackSelect
                 Renderer wr = wall.GetComponent<Renderer>();
                 if (wr != null) box.GetComponent<Renderer>().sharedMaterial = wr.sharedMaterial;
             }
+            MapView.Invalidate();
             Debug.Log(Tag + $"obstacle at ROS ({x:0.00}, {y:0.00}), {size:0.00} m, ground {ground:0.00}, layer {box.layer}");
             return $"obstacle at ({x:0.00}, {y:0.00}), {size:0.00} m box, ground y {ground:0.00}, layer {LayerMask.LayerToName(box.layer)}";
         }
@@ -338,7 +339,8 @@ namespace TrackSelect
         {
             GameObject[] boxes = Resources.FindObjectsOfTypeAll<GameObject>()
                 .Where(g => g.name == ObstacleName && g.scene.isLoaded).ToArray();
-            foreach (GameObject g in boxes) Destroy(g);
+            foreach (GameObject g in boxes) { g.SetActive(false); Destroy(g); }   // Destroy waits for the frame's end
+            MapView.Invalidate();
             return $"removed {boxes.Length} obstacle(s)";
         }
 

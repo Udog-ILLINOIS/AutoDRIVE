@@ -48,6 +48,7 @@ namespace TrackSelect
             SceneManager.sceneLoaded += (scene, mode) => Apply();
             SimControl.Init();   // registers its own sceneLoaded handler after this one
             Livery.Init();
+            MapView.Init();
         }
 
         public static string Key(string s) => new string(s.ToLower().Where(char.IsLetterOrDigit).ToArray());

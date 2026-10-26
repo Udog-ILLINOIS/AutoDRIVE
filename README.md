@@ -36,6 +36,7 @@ The stock app's own data files are not modified: the plugin is loaded next to th
 | **Autoconnect** | `-autoconnect` keeps the sim connected to the bridge and reconnects after bridge restarts, without clicking **Connect**. It works around the stock Socket.IO client, which retries without pause when no bridge answers (leaking a socket each time and flooding `Player.log`). |
 | **Safe disconnect** | When the connection drops, the car's throttle and steering are zeroed, so a dead bridge does not leave the car driving on its last command. |
 | **Car livery** | Decals on the car from `livery/livery.json` (pose in the car's frame, a PNG each). Included: the SIGRobotics logo on the rear fin. |
+| **Map view** | Replaces the Front Camera Preview (right-hand HUD) with two tabs. **Ground Truth** draws the active track's walls from its own mesh, in the style of the stack's map, and the car's real pose, every frame. **Mapping** draws the occupancy grid the ROS stack maps or localizes on, live while mapping, thresholded as `save_map` writes it, and where the stack thinks the car is (TF `map -> base_link`). The car is drawn to scale from its own meshes. The Mapping data comes from the club stack's `autodrive_bridge map_view` node over TCP on 127.0.0.1:4581 (`-mapview-port`). Both views refit when the track or the map changes. Under the figure: **Map error**, the mean distance of the map's walls from the real ones (a perfect 5 cm map scores ~1.3 cm on Porto), and **Localization error**, the mean distance of the estimated `base_link` from the real one over the last 5 s, both with the map placed where its walls best fit the real walls. |
 | **Control port** | A TCP control port on 127.0.0.1:4580 with JSON replies: status, track switching, connect/disconnect, pressing UI buttons by name, screenshots of the sim window. |
 
 ## Tracks
@@ -152,6 +153,8 @@ This is the `f1tenth_multitrack` branch of our fork of [Tinker-Twins/AutoDRIVE](
 track_select/TrackSelector.cs    -track, built-in and custom tracks, switching while running
 track_select/SimControl.cs       -autoconnect, control port, Map row in the Menu panel
 track_select/Livery.cs           decals on the car from livery/livery.json
+track_select/MapView.cs          Ground Truth / Mapping tabs in place of the Front Camera Preview (port 4581)
+track_select/MapAccuracy.cs      the map view's map and localization error against the real track
 track_select/TrackSelect.csproj  plugin project, built against the stock app's assemblies
 livery/                          livery.json (decal poses, car frame: x right, y up, z forward) + images
 tracks/<name>/                   custom tracks: mesh.bin (wall mesh) + track.json (checkpoints, spawns, camera)
