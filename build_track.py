@@ -23,7 +23,7 @@ export: writes tracks/<name>/mesh.bin (Porto-style duct mesh) and track.json (ch
   builds the track at startup by cloning Porto's objects. The map frame is the sim's world frame
   (ROS x = Unity z, ROS y = -Unity x), so ForzaETH needs no localization offset.
 app: copies the stock app, adds TrackSelect.dll (built with ~/.dotnet; TrackSelector.cs + SimControl.cs + Livery.cs
-  + MapView.cs + MapAccuracy.cs: -autoconnect, control port, Map row in the Menu panel, car decals, Ground Truth / Mapping
+  + MapView.cs + MapAccuracy.cs + MapBlocks.cs: -autoconnect, control port, Map row in the Menu panel, car decals, Ground Truth / Mapping
   view), livery/ and every tracks/<name>/,
   and signs the copy ad hoc. The stock app's own data files are not modified.
 """

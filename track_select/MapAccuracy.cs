@@ -46,6 +46,7 @@ namespace TrackSelect
             while (estimates.TryDequeue(out _)) { }
             pending.Clear(); truthHistory.Clear(); pairs.Clear();
             fitted = false;
+            alignedSeq = -1;
             mapError = locError = float.NaN;
         }
 
@@ -158,13 +159,18 @@ namespace TrackSelect
             while (stale < pairs.Count && Seconds(now - pairs[stale].est.t) > FitWindow) stale++;
             if (stale > 0) pairs.RemoveRange(0, stale);
 
-            if (Time.realtimeSinceStartup < nextScore) return;
+            if (Time.realtimeSinceStartup < nextScore)
+            {
+                if (alignedSeq != mapSeqShown) DrawAligned();   // a new map: at once, in the last fit (or centred)
+                return;
+            }
             nextScore = Time.realtimeSinceStartup + 0.5f;
             Fit();
             List<Vector2> walls = MapWalls();
             if (fitted && walls.Count >= 20 && wallDistance != null) AlignToWalls(walls);
             ScoreMap(walls);
             ScoreLocalization(now);
+            DrawAligned();
         }
 
         // map -> world: least squares over the window's positions (2D Kabsch), or the mean heading

@@ -9,7 +9,7 @@
 //   printf 'status\n' | nc 127.0.0.1 4580        (./autodrive.sh ctl status)
 //   status | tracks | track <name> | connect [ip [port]] | disconnect | reconnect | kick
 //   | click <button> | screenshot [path] | tree [^]<object> [depth] | bounds <object> | livery
-//   | obstacle <x> <y> [size] | obstacle clear | clickat <x> <y>
+//   | obstacle <x> <y> [size] | obstacle clear | clickat <x> <y> | drag <x0> <y0> <x1> <y1>
 // click <button> is the way to press the sim's buttons: the pointer events of a mouse click, sent to
 // the visible object with that name (Menu, "Driving Mode", Map, "Map Porto", "Scene Reset", ...). It
 // does not move the real mouse. clickat sends them to whatever UI is drawn at x, y (0-1 of the window,
@@ -236,6 +236,15 @@ namespace TrackSelect
                         if (hits.Count == 0) return Json(false, "error", $"no UI at ({pos.x:0}, {pos.y:0}) px");
                         return Click(hits[0].gameObject, data);
                     }
+                case "drag":   // drag <x0> <y0> <x1> <y1>: press at one point and drag to the other (0-1 of the
+                               // window, from top left), as a mouse would. Layout checks and tests only, like clickat
+                    {
+                        var f = new float[4];
+                        if (w.Length < 5 || Enumerable.Range(0, 4).Any(k => !float.TryParse(w[k + 1], NumberStyles.Float, CultureInfo.InvariantCulture, out f[k])))
+                            return Json(false, "error", "usage: drag <x0> <y0> <x1> <y1>   (0-1 of the window, from its top left)");
+                        return Drag(new Vector2(f[0] * Screen.width, (1f - f[1]) * Screen.height),
+                                    new Vector2(f[2] * Screen.width, (1f - f[3]) * Screen.height));
+                    }
                 case "screenshot":   // screenshot [path]: the sim's own picture (no other windows), PNG
                     {
                         string path = w.Length > 1 ? string.Join(" ", w.Skip(1))
@@ -302,7 +311,7 @@ namespace TrackSelect
                                                 "disconnect, reconnect, kick, click <button>, screenshot [path], " +
                                                 "tree [^]<object> [depth], bounds <object>, livery, " +
                                                 "obstacle <x> <y> [size] | obstacle clear, " +
-                                                "clickat <x> <y> (layout checks only)");
+                                                "clickat <x> <y> | drag <x0> <y0> <x1> <y1> (layout checks and tests only)");
             }
         }
 
@@ -311,6 +320,14 @@ namespace TrackSelect
         internal const string ObstacleName = "SimControl Obstacle";   // MapView draws them too
 
         static string PlaceObstacle(float x, float y, float size)
+        {
+            GameObject box = CreateObstacle(x, y, size);
+            return $"obstacle at ({x:0.00}, {y:0.00}), {size:0.00} m box, ground y {box.transform.position.y - 0.2f:0.00}, " +
+                   $"layer {LayerMask.LayerToName(box.layer)}";
+        }
+
+        // A size x 0.4 x size m box standing on the ground at ROS world x, y (also MapView's block bar).
+        internal static GameObject CreateObstacle(float x, float y, float size)
         {
             var at = new Vector3(-y, 0f, x);   // ROS x = Unity z, ROS y = -Unity x
             Transform track = Resources.FindObjectsOfTypeAll<Transform>()
@@ -332,7 +349,15 @@ namespace TrackSelect
             }
             MapView.Invalidate();
             Debug.Log(Tag + $"obstacle at ROS ({x:0.00}, {y:0.00}), {size:0.00} m, ground {ground:0.00}, layer {box.layer}");
-            return $"obstacle at ({x:0.00}, {y:0.00}), {size:0.00} m box, ground y {ground:0.00}, layer {LayerMask.LayerToName(box.layer)}";
+            return box;
+        }
+
+        internal static void RemoveObstacle(GameObject box)
+        {
+            if (box == null) return;
+            box.SetActive(false);   // Destroy waits for the frame's end
+            Destroy(box);
+            MapView.Invalidate();
         }
 
         static string ClearObstacles()
@@ -723,6 +748,36 @@ namespace TrackSelect
             ExecuteEvents.ExecuteHierarchy(target, data, ExecuteEvents.pointerExitHandler);
             return "{\"ok\":" + (clicked != null ? "true" : "false") + ",\"hit\":" + Str(target.name) +
                    ",\"clicked\":" + Str(clicked == null ? null : clicked.name) + "}";
+        }
+
+        // The pointer events of a mouse drag from a to b (screen pixels): down, begin, 10 moves, up and drop,
+        // to the drag handler under a, as Unity's input module sends them.
+        static string Drag(Vector2 a, Vector2 b)
+        {
+            EventSystem es = EventSystem.current;
+            if (es == null) return Json(false, "error", "no EventSystem");
+            var data = new PointerEventData(es) { position = a, pressPosition = a, button = PointerEventData.InputButton.Left };
+            var hits = new System.Collections.Generic.List<RaycastResult>();
+            es.RaycastAll(data, hits);
+            if (hits.Count == 0) return Json(false, "error", $"no UI at ({a.x:0}, {a.y:0}) px");
+            GameObject handler = ExecuteEvents.GetEventHandler<IBeginDragHandler>(hits[0].gameObject);
+            if (handler == null) return Json(false, "error", "nothing draggable at " + hits[0].gameObject.name);
+            data.pointerPressRaycast = data.pointerCurrentRaycast = hits[0];
+            data.pointerDrag = handler;
+            ExecuteEvents.Execute(handler, data, ExecuteEvents.initializePotentialDrag);
+            data.dragging = true;
+            ExecuteEvents.Execute(handler, data, ExecuteEvents.beginDragHandler);
+            for (int k = 1; k <= 10; k++)
+            {
+                data.position = Vector2.Lerp(a, b, k / 10f);
+                ExecuteEvents.Execute(handler, data, ExecuteEvents.dragHandler);
+            }
+            hits.Clear();
+            es.RaycastAll(data, hits);
+            data.pointerCurrentRaycast = hits.Count > 0 ? hits[0] : new RaycastResult();
+            ExecuteEvents.Execute(handler, data, ExecuteEvents.endDragHandler);
+            return "{\"ok\":true,\"dragged\":" + Str(handler.name) + ",\"to\":" +
+                   Str(hits.Count > 0 ? hits[0].gameObject.name : null) + "}";
         }
 
         static void Tree(Transform t, int level, int depth, StringBuilder sb)

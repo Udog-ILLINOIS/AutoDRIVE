@@ -3,12 +3,18 @@
 //                 map (redrawn when the track switches, the scene reloads or an obstacle is placed), and
 //                 the car where it really is, read from its transform every frame
 // The car is drawn to scale from its own meshes (BuildCarSprite), in both tabs.
+// Block bar (MapBlocks.cs), a thin strip between the tabs and the figure: drag its square onto the track to put a 0.3 m block on
+// the real track there; drag a block's handle to move it, or back into the bar to remove it.
 //   Mapping       the occupancy grid the stack maps / localizes on, and where the stack thinks the car
 //                 is on it, as the ROS node autodrive_bridge map_view sends them (club stack,
 //                 planners/sigrobotics): /map whenever it is published (it grows while mapping) and
 //                 TF map -> base_link at 50 Hz
 // Both are fitted to the panel, x right and y up as in RViz (ROS x = Unity z, ROS y = -Unity x), and
-// refitted when the track or the map changes size. Tabs: "Ground Truth Tab", "Mapping Tab" (also
+// refitted when the track or the map changes size. Once the map's placement on the real track is known
+// (MapAccuracy.cs), the Mapping tab is drawn in the Ground Truth tab's frame, area and scale, so
+// switching tabs leaves the track in place and only real map and pose errors move. Until then (no poses
+// from the stack yet) it has the same area and scale, the map centred in it and turned in quarter turns
+// to fit best. Tabs: "Ground Truth Tab", "Mapping Tab" (also
 // ./autodrive.sh ctl click "Mapping Tab").
 //
 // map_view connects to 127.0.0.1:4581 (-mapview-port <n>); from the ROS container that is
@@ -72,6 +78,10 @@ namespace TrackSelect
         string gtTrack;         // track gtTex was drawn for
         bool gtDirty = true;
         int mapSeqShown = -1; int mapTexW, mapTexH; float mapTexRes, mapTexOx, mapTexOy, mapTexYaw;
+        Texture2D alignedTex;   // the map resampled into gtRect (world frame), through the map -> world fit
+        int alignedSeq = -1;    // the map it was drawn from
+        bool alignedOnTrack;    // drawn through the fit (else centred, as the map lies unaligned)
+        float viewCos = 1f, viewSin, viewX, viewY;   // map -> gtRect frame it was drawn with
         Transform car;
         Sprite carSprite;      // the car seen from above, nose to +x
         Vector2 carSize;       // its length and width (m)
@@ -90,7 +100,7 @@ namespace TrackSelect
         }
 
         /// <summary>Redraw the Ground Truth tab (the scene changed, e.g. an obstacle was placed).</summary>
-        public static void Invalidate() { if (instance != null) instance.gtDirty = true; }
+        public static void Invalidate() { if (instance != null) instance.gtDirty = instance.blocksDirty = true; }
 
         void OnSceneLoaded()
         {
@@ -230,22 +240,35 @@ namespace TrackSelect
             }
             if (!connected)
             {
-                Show(mapTex, mapTexW / (float)Math.Max(mapTexH, 1), 1f, false, 0f, 0f, 0f,
-                     $"waiting for ROS map_view (bridge launch) on :{port}");
+                if (alignedTex != null && gtTex != null)
+                    Show(alignedTex, gtRect.width / gtRect.height, gtRect.width, false, 0f, 0f, 0f, $"waiting for ROS map_view (bridge launch) on :{port}");
+                else
+                    Show(mapTex, mapTexW / (float)Math.Max(mapTexH, 1), 1f, false, 0f, 0f, 0f, $"waiting for ROS map_view (bridge launch) on :{port}");
                 return;
             }
             if (mapTex == null) { Show(null, 1f, 1f, false, 0f, 0f, 0f, "connected; waiting for /map"); return; }
             // base_link is the rear axle: the marker is drawn around the car's middle, ahead of it
             FindCar();
-            float cx = x + carRearAxle * Mathf.Cos(yaw), cy = y + carRearAxle * Mathf.Sin(yaw);
-            // map frame -> grid cells (the grid's origin can be rotated)
-            float dx = cx - mapTexOx, dy = cy - mapTexOy, c = Mathf.Cos(mapTexYaw), s = Mathf.Sin(mapTexYaw);
-            float u = (c * dx + s * dy) / mapTexRes, v = (-s * dx + c * dy) / mapTexRes;
             bool fresh = poseAge < 0.5;
             string text = $"map {mapTexW}×{mapTexH} @ {mapTexRes:0.00} m   ";
             text += poseAge < double.PositiveInfinity ? $"x {x:0.00}  y {y:0.00}  yaw {yaw * Mathf.Rad2Deg:0}°" : "no TF map → base_link";
             if (poseAge < double.PositiveInfinity && !fresh) text += $"  ({poseAge:0} s old)";
             if (mapAge > 3.0) text += $"   map {mapAge:0} s old";
+            if (alignedTex != null && gtTex != null)
+            {
+                if (!alignedOnTrack) text += "   not aligned yet";
+                // in the Ground Truth area and scale: the estimate through the transform the map was drawn with
+                float wx = viewCos * x - viewSin * y + viewX, wy = viewSin * x + viewCos * y + viewY;
+                float wyaw = yaw + Mathf.Atan2(viewSin, viewCos);
+                wx += carRearAxle * Mathf.Cos(wyaw); wy += carRearAxle * Mathf.Sin(wyaw);
+                Show(alignedTex, gtRect.width / gtRect.height, gtRect.width, poseAge < double.PositiveInfinity && carSprite != null,
+                     (wx - gtRect.xMin) / gtRect.width, (wy - gtRect.yMin) / gtRect.height, wyaw, text, fresh ? 1f : 0.35f);
+                return;
+            }
+            float cx = x + carRearAxle * Mathf.Cos(yaw), cy = y + carRearAxle * Mathf.Sin(yaw);
+            // map frame -> grid cells (the grid's origin can be rotated)
+            float dx = cx - mapTexOx, dy = cy - mapTexOy, c = Mathf.Cos(mapTexYaw), s = Mathf.Sin(mapTexYaw);
+            float u = (c * dx + s * dy) / mapTexRes, v = (-s * dx + c * dy) / mapTexRes;
             Show(mapTex, mapTexW / (float)mapTexH, mapTexW * mapTexRes, poseAge < double.PositiveInfinity && carSprite != null,
                  u / mapTexW, v / mapTexH, yaw - mapTexYaw, text, fresh ? 1f : 0.35f);
         }
@@ -259,17 +282,22 @@ namespace TrackSelect
             // the figure at the top of the view, the accuracy line under it, the status line at the bottom
             Rect r = view.rect;
             ScaleText(r);
-            float height = Mathf.Max(r.height - 2f * textRow - 6f, 10f);
+            float barH = LayoutBar(r);   // the block bar, a strip across the top, above the figure
+            float height = Mathf.Max(r.height - barH - 2f * textRow - 6f, 10f);
             if (!(aspect > 0f) || float.IsInfinity(aspect)) aspect = 1f;
+            float width = r.width;
             // turned a quarter (x up) when that shows it larger, e.g. a tall track in the wide panel
-            float w = Mathf.Min(r.width, height * aspect), wTurned = Mathf.Min(height, r.width * aspect);
+            float w = Mathf.Min(width, height * aspect), wTurned = Mathf.Min(height, width * aspect);
             bool turned = wTurned > w * 1.05f;
             if (turned) w = wTurned;
             float shown = turned ? w : w / aspect;   // its height on screen
             image.sizeDelta = new Vector2(w, w / aspect);
             image.localEulerAngles = new Vector3(0f, 0f, turned ? 90f : 0f);
-            image.anchoredPosition = new Vector2(0f, -2f - shown / 2f);
-            accuracyRect.anchoredPosition = new Vector2(0f, -4f - shown);
+            image.anchoredPosition = new Vector2(0f, -barH - 2f - shown / 2f);
+            figureIsWorld = tex != null && (tex == gtTex || (tex == alignedTex && alignedOnTrack));
+            figurePxPerM = w / across;
+            UpdateHandles();
+            accuracyRect.anchoredPosition = new Vector2(0f, -barH - 4f - shown);
             accuracyText.text = AccuracyText();
             marker.gameObject.SetActive(showCar && tex != null);
             if (marker.gameObject.activeSelf)
@@ -301,6 +329,8 @@ namespace TrackSelect
             if (mapTex != null) Destroy(mapTex);
             mapTex = null;
             mapTexW = mapTexH = 0;
+            if (alignedTex != null) Destroy(alignedTex);
+            alignedTex = null;
         }
 
         void UpdateMapTexture()
@@ -334,6 +364,69 @@ namespace TrackSelect
         }
 
         const int OccupiedPct = 65, FreePct = 25;   // save_map's OCCUPIED_THRESH / FREE_THRESH
+
+        // The map resampled into the Ground Truth area at half its cell size (finer, so the turn does not
+        // show as jagged steps), each pixel the map cell under it through the map -> world fit. Cells
+        // outside gtRect (the track plus 0.3 m) are not shown.
+        void DrawAligned()
+        {
+            byte[] cells; int mw, mh; float res, ox, oy, myaw; int seq;
+            lock (sync) { cells = mapCells; mw = mapW; mh = mapH; res = mapRes; ox = mapOx; oy = mapOy; myaw = mapYaw; seq = mapSeq; }
+            if (cells == null || gtTex == null || res <= 0f) return;
+            int w = Math.Min(gtTex.width * 2, 2048), h = Math.Min(gtTex.height * 2, 2048);
+            float sx = gtRect.width / w, sy = gtRect.height / h;
+            if (fitted) { viewCos = fitCos; viewSin = fitSin; viewX = fitX; viewY = fitY; }
+            else if (!CentreMap(cells, mw, mh, res, ox, oy, myaw)) return;
+            alignedOnTrack = fitted;
+            // gtRect frame -> map (inverse view transform), then map -> grid (inverse origin)
+            float ic = viewCos, isn = -viewSin, mc = Mathf.Cos(myaw), ms = -Mathf.Sin(myaw);
+            if (alignedTex == null || alignedTex.width != w || alignedTex.height != h)
+            {
+                if (alignedTex != null) Destroy(alignedTex);
+                alignedTex = NewTexture(w, h);
+            }
+            var px = new Color32[w * h];
+            for (int j = 0; j < h; j++)
+                for (int i = 0; i < w; i++)
+                {
+                    float x = gtRect.xMin + (i + 0.5f) * sx - viewX, y = gtRect.yMin + (j + 0.5f) * sy - viewY;
+                    float mx = ic * x - isn * y - ox, my = isn * x + ic * y - oy;
+                    int ci = Mathf.FloorToInt((mc * mx - ms * my) / res), cj = Mathf.FloorToInt((ms * mx + mc * my) / res);
+                    if (ci < 0 || cj < 0 || ci >= mw || cj >= mh) { px[j * w + i] = Unknown; continue; }
+                    sbyte p = (sbyte)cells[cj * mw + ci];
+                    px[j * w + i] = p >= OccupiedPct ? Wall : p >= 0 && p <= FreePct ? Free : Unknown;
+                }
+            alignedTex.SetPixels32(px);
+            alignedTex.Apply(false);
+            alignedSeq = seq;
+        }
+
+        // The view transform for a map not yet placed on the track: its known cells' box centred on gtRect,
+        // turned a quarter if that fits it better. False if the map has no known cells.
+        bool CentreMap(byte[] cells, int mw, int mh, float res, float ox, float oy, float myaw)
+        {
+            int i0 = mw, i1 = -1, j0 = mh, j1 = -1;
+            for (int j = 0; j < mh; j++)
+                for (int i = 0; i < mw; i++)
+                    if ((sbyte)cells[j * mw + i] >= 0) { i0 = Math.Min(i0, i); i1 = Math.Max(i1, i); j0 = Math.Min(j0, j); j1 = Math.Max(j1, j); }
+            if (i1 < 0) return false;
+            // the box's corners in the map frame
+            float c = Mathf.Cos(myaw), s = Mathf.Sin(myaw);
+            Vector2 lo = new Vector2(float.MaxValue, float.MaxValue), hi = -lo;
+            foreach (var (gi, gj) in new[] { (i0, j0), (i1 + 1, j0), (i0, j1 + 1), (i1 + 1, j1 + 1) })
+            {
+                var p = new Vector2(ox + c * gi * res - s * gj * res, oy + s * gi * res + c * gj * res);
+                lo = Vector2.Min(lo, p); hi = Vector2.Max(hi, p);
+            }
+            Vector2 size = hi - lo, mid = (lo + hi) / 2f;
+            float straight = Mathf.Max(size.x / gtRect.width, size.y / gtRect.height);
+            float turned = Mathf.Max(size.y / gtRect.width, size.x / gtRect.height);
+            float th = turned < straight ? Mathf.PI / 2f : 0f;
+            viewCos = Mathf.Cos(th); viewSin = Mathf.Sin(th);
+            viewX = gtRect.center.x - (viewCos * mid.x - viewSin * mid.y);
+            viewY = gtRect.center.y - (viewSin * mid.x + viewCos * mid.y);
+            return true;
+        }
 
         static Texture2D NewTexture(int w, int h) =>
             new Texture2D(w, h, TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear, wrapMode = TextureWrapMode.Clamp };
@@ -567,6 +660,10 @@ namespace TrackSelect
             Transform cam = p.transform.Find("Front Camera Preview"), lab = p.transform.Find("Label");
             if (cam == null || lab == null) { Debug.LogWarning(Tag + "Front Camera Preview layout changed: no map view"); searchUntil = 0f; return; }
             cameraImage = cam.gameObject; label = lab.gameObject;
+            // a little larger than the camera preview was (anchors 0.07-0.93 x 0.33-0.54 of the HUD), into the
+            // gaps beside it and above and below it (the HUD text ends at 0.56, the lap times start at 0.29)
+            var prt = (RectTransform)p.transform;
+            prt.anchorMin = new Vector2(0.04f, 0.30f); prt.anchorMax = new Vector2(0.96f, 0.555f);
             RawImage camRaw = cameraImage.GetComponent<RawImage>();
             if (camRaw != null) camRaw.enabled = false;
             Text labelText = label.GetComponent<Text>();
@@ -583,6 +680,7 @@ namespace TrackSelect
             marker = NewRect("Car Marker", image, new Vector2(0.5f, 0.5f), new Vector2(0.5f, 0.5f));
             markerImage = marker.gameObject.AddComponent<Image>();
             markerImage.raycastTarget = false;
+            imageRaw.raycastTarget = false;
 
             var srt = NewRect("Map Status", view, new Vector2(0f, 0f), new Vector2(1f, 0f));
             srt.pivot = new Vector2(0.5f, 0f);
@@ -609,6 +707,7 @@ namespace TrackSelect
             accuracyText.raycastTarget = false;
 
             tabTexts.Clear();
+            BuildBar();
             var labRt = (RectTransform)lab;
             gtTab = Tab("Ground Truth Tab", "Ground Truth", p.transform, labRt, labelText, 0f, 0.5f, false);
             mapTab = Tab("Mapping Tab", "Mapping", p.transform, labRt, labelText, 0.5f, 1f, true);
