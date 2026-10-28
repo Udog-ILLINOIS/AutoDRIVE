@@ -8,13 +8,15 @@
 //   Mapping       the occupancy grid the stack maps / localizes on, and where the stack thinks the car
 //                 is on it, as the ROS node autodrive_bridge map_view sends them (club stack,
 //                 planners/sigrobotics): /map whenever it is published (it grows while mapping) and
-//                 TF map -> base_link at 50 Hz
+//                 TF map -> base_link at 50 Hz. As in the Ground Truth tab, the floor is drawn only on the
+//                 track (TrackFloor): the map's free cells inside its walls, not unknown space, outside the
+//                 outer wall or inside the islands (map_server maps mark those free too)
 // Both are fitted to the panel, x right and y up as in RViz (ROS x = Unity z, ROS y = -Unity x), and
 // refitted when the track or the map changes size. Once the map's placement on the real track is known
 // (MapAccuracy.cs), the Mapping tab is drawn in the Ground Truth tab's frame, area and scale, so
-// switching tabs leaves the track in place and only real map and pose errors move. Until then (no poses
-// from the stack yet) it has the same area and scale, the map centred in it and turned in quarter turns
-// to fit best. Tabs: "Ground Truth Tab", "Mapping Tab" (also
+// switching tabs leaves the track in place and only real map and pose errors move. Without poses the map
+// is placed by its walls alone (MapAccuracy.RegisterToWalls); only if that is not clear is it centred
+// in the same area and scale, turned in quarter turns to fit best ("not aligned yet"). Tabs: "Ground Truth Tab", "Mapping Tab" (also
 // ./autodrive.sh ctl click "Mapping Tab").
 //
 // map_view connects to 127.0.0.1:4581 (-mapview-port <n>); from the ROS container that is
@@ -78,6 +80,7 @@ namespace TrackSelect
         string gtTrack;         // track gtTex was drawn for
         bool gtDirty = true;
         int mapSeqShown = -1; int mapTexW, mapTexH; float mapTexRes, mapTexOx, mapTexOy, mapTexYaw;
+        byte[] mapTexCells, mapTexClass;   // the map shown, and per cell 0 off the track, 1 wall, 2 track floor
         Texture2D alignedTex;   // the map resampled into gtRect (world frame), through the map -> world fit
         int alignedSeq = -1;    // the map it was drawn from
         bool alignedOnTrack;    // drawn through the fit (else centred, as the map lies unaligned)
@@ -329,19 +332,21 @@ namespace TrackSelect
             if (mapTex != null) Destroy(mapTex);
             mapTex = null;
             mapTexW = mapTexH = 0;
+            mapTexCells = mapTexClass = null;
             if (alignedTex != null) Destroy(alignedTex);
             alignedTex = null;
         }
 
         void UpdateMapTexture()
         {
-            byte[] cells; int w, h;
+            byte[] cells; int w, h; bool posed; float px, py;
             lock (sync)
             {
                 if (mapSeq == mapSeqShown || mapCells == null) return;
                 mapSeqShown = mapSeq;
                 cells = mapCells; w = mapW; h = mapH;
                 mapTexRes = mapRes; mapTexOx = mapOx; mapTexOy = mapOy; mapTexYaw = mapYaw;
+                posed = poseTicks != 0; px = poseX; py = poseY;
             }
             if (w == 0 || h == 0) return;
             if (mapTex == null || mapTex.width != w || mapTex.height != h)
@@ -349,30 +354,137 @@ namespace TrackSelect
                 if (mapTex != null) Destroy(mapTex);
                 mapTex = NewTexture(w, h);
             }
-            // as the stack's saved map (perception save_map, map_server trinary): occupied from 65 %, free up
-            // to 25 %, unknown in between. Cartographer keeps cells it has seen only a few times near 50 %
-            // (or ~20 % once mostly seen free); shading those showed as pale smears off the walls.
-            var px = new Color32[w * h];
-            for (int i = 0; i < px.Length; i++)
+            // the track around the stack's pose (base_link), if it has sent one
+            int si = -1, sj = -1;
+            if (posed && mapTexRes > 0f)
             {
-                sbyte p = (sbyte)cells[i];
-                px[i] = p >= OccupiedPct ? Wall : p >= 0 && p <= FreePct ? Free : Unknown;
+                float dx = px - mapTexOx, dy = py - mapTexOy, c = Mathf.Cos(mapTexYaw), s = Mathf.Sin(mapTexYaw);
+                si = Mathf.FloorToInt((c * dx + s * dy) / mapTexRes); sj = Mathf.FloorToInt((-s * dx + c * dy) / mapTexRes);
             }
-            mapTex.SetPixels32(px);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            byte[] cls = TrackFloor(cells, w, h, si, sj, out string how);
+            var tex = new Color32[w * h];
+            for (int i = 0; i < tex.Length; i++) tex[i] = cls[i] == 1 ? Wall : cls[i] == 2 ? Free : Unknown;
+            mapTex.SetPixels32(tex);
             mapTex.Apply(false);
             mapTexW = w; mapTexH = h;
+            mapTexCells = cells; mapTexClass = cls;
+            Debug.Log(Tag + $"map {w}x{h}: floor {how}; {sw.ElapsedMilliseconds} ms");
         }
 
         const int OccupiedPct = 65, FreePct = 25;   // save_map's OCCUPIED_THRESH / FREE_THRESH
+        const int GapCells = 2;   // wall gaps up to 2 * this many cells wide are closed for TrackFloor
+
+        // Each cell as the stack's saved map has it (perception save_map, map_server trinary): occupied from
+        // 65 %, free up to 25 %, unknown in between. Cartographer keeps cells it has seen only a few times
+        // near 50 % (or ~20 % once mostly seen free); shading those showed as pale smears off the walls.
+        // Of the free cells only the track's are floor, as the Ground Truth tab's flood fill from the car:
+        // the free cells 4-connected to the stack's pose (si, sj), or without one the largest such region
+        // that does not reach the map's edge (the outside does; islands are smaller than the track). Walls
+        // are thickened by GapCells for that, so a gap of a few cells does not join the track to the
+        // outside, and the floor grown back by as much afterwards. Nothing found: every free cell (as before).
+        static byte[] TrackFloor(byte[] cells, int w, int h, int si, int sj, out string how)
+        {
+            int n = w * h;
+            var cls = new byte[n];   // 0 off the track, 1 wall, 2 track floor
+            var free = new bool[n];
+            for (int k = 0; k < n; k++)
+            {
+                sbyte p = (sbyte)cells[k];
+                if (p >= OccupiedPct) cls[k] = 1;
+                else free[k] = p >= 0 && p <= FreePct;
+            }
+            // near a wall: within GapCells (a square), a row pass then a column pass
+            var nearRow = new bool[n]; var near = new bool[n];
+            for (int j = 0; j < h; j++)
+                for (int i = 0; i < w; i++)
+                    if (cls[j * w + i] == 1)
+                        for (int a = Math.Max(i - GapCells, 0); a <= Math.Min(i + GapCells, w - 1); a++) nearRow[j * w + a] = true;
+            for (int j = 0; j < h; j++)
+                for (int i = 0; i < w; i++)
+                    if (nearRow[j * w + i])
+                        for (int b = Math.Max(j - GapCells, 0); b <= Math.Min(j + GapCells, h - 1); b++) near[b * w + i] = true;
+
+            // the regions of free cells away from the walls
+            var label = new int[n];
+            for (int k = 0; k < n; k++) label[k] = -1;
+            var size = new List<int>(); var edge = new List<bool>();
+            var stack = new Stack<int>();
+            for (int k0 = 0; k0 < n; k0++)
+            {
+                if (!free[k0] || near[k0] || label[k0] >= 0) continue;
+                int id = size.Count, count = 0; bool atEdge = false;
+                label[k0] = id; stack.Push(k0);
+                while (stack.Count > 0)
+                {
+                    int k = stack.Pop(), i = k % w, j = k / w;
+                    count++;
+                    if (i == 0 || j == 0 || i == w - 1 || j == h - 1) { atEdge = true; }
+                    if (i > 0) Visit(k - 1); if (i < w - 1) Visit(k + 1);
+                    if (j > 0) Visit(k - w); if (j < h - 1) Visit(k + w);
+                }
+                size.Add(count); edge.Add(atEdge);
+
+                void Visit(int m)
+                {
+                    if (free[m] && !near[m] && label[m] < 0) { label[m] = id; stack.Push(m); }
+                }
+            }
+
+            // the track: the region under the pose (or within a few cells of it, close to a wall), else the largest inside
+            int track = -1;
+            for (int r = 0; r <= GapCells + 2 && track < 0 && si >= 0; r++)
+                for (int b = sj - r; b <= sj + r && track < 0; b++)
+                    for (int a = si - r; a <= si + r && track < 0; a++)
+                        if (a >= 0 && b >= 0 && a < w && b < h && label[b * w + a] >= 0) track = label[b * w + a];
+            how = track >= 0 ? "track at the pose" : "";
+            if (track < 0)
+            {
+                for (int id = 0; id < size.Count; id++)
+                    if (!edge[id] && (track < 0 || size[id] > size[track])) track = id;
+                how = track >= 0 ? "largest region inside the walls" : "every free cell (no region inside the walls)";
+            }
+            if (track < 0)
+            {
+                for (int k = 0; k < n; k++) if (free[k]) cls[k] = 2;
+                return cls;
+            }
+
+            // the region, grown back over free cells by GapCells, diagonals too (as `near`) but not past a
+            // wall's corner, so it reaches the walls
+            var front = new List<int>();
+            for (int k = 0; k < n; k++) if (label[k] == track) { cls[k] = 2; front.Add(k); }
+            for (int step = 0; step < GapCells; step++)
+            {
+                var next = new List<int>();
+                foreach (int k in front)
+                {
+                    int i = k % w, j = k / w;
+                    for (int dj = -1; dj <= 1; dj++)
+                        for (int di = -1; di <= 1; di++)
+                        {
+                            int a = i + di, b = j + dj;
+                            if (a < 0 || b < 0 || a >= w || b >= h) continue;
+                            int m = b * w + a;
+                            if (!free[m] || cls[m] != 0) continue;
+                            if (di != 0 && dj != 0 && (cls[j * w + a] == 1 || cls[b * w + i] == 1)) continue;
+                            cls[m] = 2; next.Add(m);
+                        }
+                }
+                front = next;
+            }
+            return cls;
+        }
 
         // The map resampled into the Ground Truth area at half its cell size (finer, so the turn does not
         // show as jagged steps), each pixel the map cell under it through the map -> world fit. Cells
         // outside gtRect (the track plus 0.3 m) are not shown.
         void DrawAligned()
         {
-            byte[] cells; int mw, mh; float res, ox, oy, myaw; int seq;
-            lock (sync) { cells = mapCells; mw = mapW; mh = mapH; res = mapRes; ox = mapOx; oy = mapOy; myaw = mapYaw; seq = mapSeq; }
-            if (cells == null || gtTex == null || res <= 0f) return;
+            // the map shown in the Mapping tab (UpdateMapTexture), with its track floor
+            byte[] cells = mapTexCells, cls = mapTexClass; int mw = mapTexW, mh = mapTexH;
+            float res = mapTexRes, ox = mapTexOx, oy = mapTexOy, myaw = mapTexYaw; int seq = mapSeqShown;
+            if (cells == null || cls == null || gtTex == null || res <= 0f) return;
             int w = Math.Min(gtTex.width * 2, 2048), h = Math.Min(gtTex.height * 2, 2048);
             float sx = gtRect.width / w, sy = gtRect.height / h;
             if (fitted) { viewCos = fitCos; viewSin = fitSin; viewX = fitX; viewY = fitY; }
@@ -393,8 +505,8 @@ namespace TrackSelect
                     float mx = ic * x - isn * y - ox, my = isn * x + ic * y - oy;
                     int ci = Mathf.FloorToInt((mc * mx - ms * my) / res), cj = Mathf.FloorToInt((ms * mx + mc * my) / res);
                     if (ci < 0 || cj < 0 || ci >= mw || cj >= mh) { px[j * w + i] = Unknown; continue; }
-                    sbyte p = (sbyte)cells[cj * mw + ci];
-                    px[j * w + i] = p >= OccupiedPct ? Wall : p >= 0 && p <= FreePct ? Free : Unknown;
+                    byte c = cls[cj * mw + ci];
+                    px[j * w + i] = c == 1 ? Wall : c == 2 ? Free : Unknown;
                 }
             alignedTex.SetPixels32(px);
             alignedTex.Apply(false);

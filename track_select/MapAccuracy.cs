@@ -10,6 +10,17 @@
 // localization number is where the car thinks it is on its own map against where it is on the real
 // track; the trajectory fit alone mixes map frames from before and after Cartographer's loop closures
 // while mapping. The latched map_to_world.yaml is a few cm off, so it is not used.
+// Without poses (no localization or mapping running, only the last map), the map is placed by its walls
+// alone (RegisterToWalls): every 5 deg around, the walls' centre of mass on the real walls' one, the
+// four best refined, the best kept if its walls lie within 8 cm of the real ones on average, or within
+// 20 cm and clearly better (1.4 times) than the best placement turned more than 20 deg from it (a map
+// that matches the walls less well, but only one way round). So the
+// Mapping tab has the Ground Truth tab's orientation then too; only the map error is shown.
+// The placement belongs to the map, not to the poses: a reset or teleport clears the pose pairs but
+// keeps the last placement, and each refit starts from whichever of the trajectory fit, the last
+// placement and the walls-alone placement fits the real walls best. Poses that are wrong for a while
+// (MCL keeps TF flowing while it relocalizes after a sim reset, so map_view sends a stale pose for
+// ~2-3 s) then only raise the localization error instead of turning the map.
 // Each estimate carries its age (map_view), and is compared with the car's pose that long ago,
 // interpolated between rendered frames. Both are reset on a track switch and when the car is moved
 // (a reset or a teleport).
@@ -17,6 +28,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using UnityEngine;
 
 namespace TrackSelect
@@ -35,7 +47,12 @@ namespace TrackSelect
         readonly List<(Sample est, Sample truth)> pairs = new List<(Sample, Sample)>();
         float[] wallDistance;   // m from each truth cell to the nearest wall surface
         Raster truthRaster;
+        Vector2 truthCentre;   // centre of mass of the real wall surface (world)
+        bool registered; int registeredSeq = -1;   // a placement from the walls alone, for that map
+        float regCos = 1f, regSin, regX, regY;
         bool fitted; float fitCos, fitSin, fitX, fitY;   // map -> world
+        bool placed; float placedCos = 1f, placedSin, placedX, placedY;   // the last placement shown, until a track switch
+        float nextStartLog;
         float mapError = float.NaN, locError = float.NaN;
         float nextScore;
 
@@ -46,6 +63,7 @@ namespace TrackSelect
             while (estimates.TryDequeue(out _)) { }
             pending.Clear(); truthHistory.Clear(); pairs.Clear();
             fitted = false;
+            placed = false;
             alignedSeq = -1;
             mapError = locError = float.NaN;
         }
@@ -94,6 +112,12 @@ namespace TrackSelect
                     d[k] = v;
                 }
             wallDistance = d;
+            Vector2 sum = Vector2.zero; int ns = 0;
+            for (int j = 0; j < h; j++)
+                for (int i = 0; i < w; i++)
+                    if (d[j * w + i] == 0f) { sum += new Vector2(r.x0 + (i + 0.5f) * r.cell, r.y0 + (j + 0.5f) * r.cell); ns++; }
+            truthCentre = ns > 0 ? sum / ns : Vector2.zero;
+            registeredSeq = -1;   // place the map again against the new truth
             nextScore = 0f;   // score the map against the new truth right away
         }
 
@@ -161,13 +185,21 @@ namespace TrackSelect
 
             if (Time.realtimeSinceStartup < nextScore)
             {
-                if (alignedSeq != mapSeqShown) DrawAligned();   // a new map: at once, in the last fit (or centred)
-                return;
+                if (alignedSeq == mapSeqShown) return;
+                // a new map: with poses, at once in the last fit; without, placed by its walls right now
+                if (fitted) { DrawAligned(); return; }
             }
             nextScore = Time.realtimeSinceStartup + 0.5f;
             Fit();
             List<Vector2> walls = MapWalls();
-            if (fitted && walls.Count >= 20 && wallDistance != null) AlignToWalls(walls);
+            if (walls.Count >= 20 && wallDistance != null)
+            {
+                if (!fitted && registeredSeq != mapSeqShown) { RegisterToWalls(walls); registeredSeq = mapSeqShown; }
+                PickStart(walls);
+                if (fitted) AlignToWalls(walls);
+            }
+            else if (!fitted && placed) { fitCos = placedCos; fitSin = placedSin; fitX = placedX; fitY = placedY; fitted = true; }
+            if (fitted) { placed = true; placedCos = fitCos; placedSin = fitSin; placedX = fitX; placedY = fitY; }
             ScoreMap(walls);
             ScoreLocalization(now);
             DrawAligned();
@@ -244,7 +276,7 @@ namespace TrackSelect
         // Pattern search from the trajectory fit to the least mean distance (capped at 0.3 m, so stray
         // cells do not pull) of the map's walls to the real ones. Along a straight the cost is flat and
         // the fit is kept.
-        void AlignToWalls(List<Vector2> pts)
+        void AlignToWalls(List<Vector2> pts, float dt = 0.05f, float da = 0.5f * Mathf.Deg2Rad)
         {
             int step = Math.Max(1, pts.Count / 4000);
             const float cap = 0.3f;
@@ -254,7 +286,6 @@ namespace TrackSelect
             Vector2 m = Vector2.zero;
             foreach (Vector2 p in pts) m += p;
             m /= pts.Count;
-            float dt = 0.05f, da = 0.5f * Mathf.Deg2Rad;
             for (int it = 0; it < 60 && dt > 0.002f; it++)
             {
                 bool moved = false;
@@ -269,6 +300,71 @@ namespace TrackSelect
                 if (!moved) { dt /= 2f; da /= 2f; }
             }
             fitCos = Mathf.Cos(th); fitSin = Mathf.Sin(th); fitX = tx; fitY = ty;
+        }
+
+        // The start for AlignToWalls: of the trajectory fit (if any), the last placement and the
+        // walls-alone placement, the one whose walls lie closest to the real ones (see the header).
+        void PickStart(List<Vector2> pts)
+        {
+            var c = new List<(string what, float cos, float sin, float x, float y)>();
+            if (fitted) c.Add(("trajectory fit", fitCos, fitSin, fitX, fitY));
+            if (placed) c.Add(("last placement", placedCos, placedSin, placedX, placedY));
+            if (registered) c.Add(("walls alone", regCos, regSin, regX, regY));
+            if (c.Count == 0) return;
+            int step = Math.Max(1, pts.Count / 4000);
+            var cost = c.Select(k => WallCost(pts, step, Mathf.Atan2(k.sin, k.cos), k.x, k.y, 0.3f)).ToList();
+            int best = cost.IndexOf(cost.Min());
+            if (fitted && best != 0 && Time.realtimeSinceStartup >= nextStartLog)
+            {
+                nextStartLog = Time.realtimeSinceStartup + 5f;
+                float turn = Mathf.DeltaAngle(Mathf.Atan2(c[best].sin, c[best].cos) * Mathf.Rad2Deg, Mathf.Atan2(fitSin, fitCos) * Mathf.Rad2Deg);
+                UnityEngine.Debug.Log(Tag + $"trajectory fit ignored (turned {turn:0.0} deg, walls {cost[0] * 100f:0.0} cm off): " +
+                          $"kept the {c[best].what} ({cost[best] * 100f:0.0} cm)");
+            }
+            (_, fitCos, fitSin, fitX, fitY) = c[best];
+            fitted = true;
+        }
+
+        // Place the map by its walls alone (no poses): see the header.
+        void RegisterToWalls(List<Vector2> pts)
+        {
+            const float cap = 0.3f;
+            Vector2 m = Vector2.zero;
+            foreach (Vector2 p in pts) m += p;
+            m /= pts.Count;
+            int coarse = Math.Max(1, pts.Count / 600);
+            var tried = new List<(float cost, float th)>();
+            for (int k = 0; k < 72; k++)
+            {
+                float th = k * 5f * Mathf.Deg2Rad, c = Mathf.Cos(th), s = Mathf.Sin(th);
+                float tx = truthCentre.x - (c * m.x - s * m.y), ty = truthCentre.y - (s * m.x + c * m.y);
+                tried.Add((WallCost(pts, coarse, th, tx, ty, cap), th));
+            }
+            float best = float.MaxValue;
+            registered = false;
+            var refined = new List<(float cost, float th)>();
+            // the best four, and the best turned well away from the first (the alternative to beat)
+            var starts = tried.OrderBy(t => t.cost).Take(4).ToList();
+            float first = starts[0].th;
+            starts.Add(tried.Where(t => Math.Abs(Mathf.DeltaAngle(t.th * Mathf.Rad2Deg, first * Mathf.Rad2Deg)) > 20f)
+                            .OrderBy(t => t.cost).First());
+            foreach (var (_, th0) in starts)
+            {
+                fitCos = Mathf.Cos(th0); fitSin = Mathf.Sin(th0);
+                fitX = truthCentre.x - (fitCos * m.x - fitSin * m.y);
+                fitY = truthCentre.y - (fitSin * m.x + fitCos * m.y);
+                AlignToWalls(pts, 0.2f, 3f * Mathf.Deg2Rad);
+                float cost = WallCost(pts, Math.Max(1, pts.Count / 4000), Mathf.Atan2(fitSin, fitCos), fitX, fitY, cap);
+                refined.Add((cost, Mathf.Atan2(fitSin, fitCos)));
+                if (cost < best) { best = cost; regCos = fitCos; regSin = fitSin; regX = fitX; regY = fitY; }
+            }
+            float bestTh = Mathf.Atan2(regSin, regCos);
+            float other = refined.Where(r => Math.Abs(Mathf.DeltaAngle(r.th * Mathf.Rad2Deg, bestTh * Mathf.Rad2Deg)) > 20f)
+                                 .Select(r => r.cost).DefaultIfEmpty(float.MaxValue).Min();
+            registered = best < 0.08f || (best < 0.2f && best * 1.4f < other);
+            UnityEngine.Debug.Log(Tag + $"map placed by its walls alone: {Mathf.Atan2(regSin, regCos) * Mathf.Rad2Deg:0.0} deg, " +
+                      $"walls {best * 100f:0.0} cm from the real ones on average (other turns: {other * 100f:0.0} cm)" +
+                      (registered ? "" : ": not clear, not used"));
         }
 
         void ScoreMap(List<Vector2> pts)
