@@ -385,6 +385,7 @@ namespace TrackSelect
             sb.Append(",\"last_frame_s\":").Append(age < 0 ? "null" : age.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             sb.Append(",\"track\":").Append(Str(TrackSelector.Current));
             sb.Append(",\"mode\":").Append(Str(vc == null ? null : vc.DrivingMode == 1 ? "Autonomous" : "Manual"));
+            sb.Append(",\"gamepad\":").Append(Str(Gamepad.Status()));
             return sb.Append('}').ToString();
         }
 

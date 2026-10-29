@@ -49,6 +49,7 @@ namespace TrackSelect
             SimControl.Init();   // registers its own sceneLoaded handler after this one
             Livery.Init();
             MapView.Init();
+            Gamepad.Init();
         }
 
         public static string Key(string s) => new string(s.ToLower().Where(char.IsLetterOrDigit).ToArray());
