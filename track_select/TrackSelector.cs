@@ -45,11 +45,15 @@ namespace TrackSelect
             string[] args = Environment.GetCommandLineArgs();
             for (int i = 0; i < args.Length - 1; i++)
                 if (args[i].ToLower() == "-track") requested = args[i + 1];
-            SceneManager.sceneLoaded += (scene, mode) => Apply();
+            // keep simulating when the window is not in front: macOS often launches the app in the
+            // background (no focus stealing), and a paused sim stalls the bridges and the control port
+            Application.runInBackground = true;
+            SceneManager.sceneLoaded += (scene, mode) => { Application.runInBackground = true; Apply(); };
             SimControl.Init();   // registers its own sceneLoaded handler after this one
             Livery.Init();
             MapView.Init();
             Gamepad.Init();
+            MultiCar.Init();   // after Apply: copies car 1 once it is on the chosen track
         }
 
         public static string Key(string s) => new string(s.ToLower().Where(char.IsLetterOrDigit).ToArray());
@@ -117,6 +121,8 @@ namespace TrackSelect
                 try { reset.Invoke(rm, null); }
                 catch (TargetInvocationException e) { Debug.LogError(Tag + "reset after the switch: " + e.InnerException); }
             }
+            MultiCar.PlaceGrid();
+            MultiCar.ResetOthers();   // cars 2..'s lap timers still held the old track's checkpoints
             return chosen;
         }
 
@@ -146,6 +152,7 @@ namespace TrackSelect
             {
                 lt.RacetrackName = chosen + " Track";
                 lt.Checkpoints = numbered;
+                if (lt.gameObject.name != "Roboracer") continue;   // cars 2..: MultiCar.PlaceGrid
                 lt.transform.SetPositionAndRotation(spawn.position, spawn.rotation);
                 Rigidbody rb = lt.GetComponent<Rigidbody>();
                 if (rb != null)

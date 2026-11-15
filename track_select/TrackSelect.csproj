@@ -24,5 +24,8 @@
     <!-- Gamepad: keyboard axes, the on-screen toast -->
     <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(ManagedDir)/UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(ManagedDir)/UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+    <!-- MultiCar: silence the copied cars' audio listeners -->
+    <Reference Include="UnityEngine.AudioModule"><HintPath>$(ManagedDir)/UnityEngine.AudioModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.VehiclesModule"><HintPath>$(ManagedDir)/UnityEngine.VehiclesModule.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 </Project>

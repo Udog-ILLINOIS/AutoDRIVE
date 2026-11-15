@@ -24,6 +24,8 @@
 //   'M'  uint32 width, height, float32 resolution, origin x, y, yaw, width * height int8 cells
 //   'P'  float32 x, y, yaw (base_link in the map frame), age (s, how old the estimate was when sent)
 //   'H'  heartbeat (empty)
+//   'L'  lines drawn over the Mapping tab, replacing the last ones: uint32 count, then per line
+//        uint8 r, g, b, a, uint32 points, points * (float32 x, y) in the map frame
 // A newer connection replaces the old one. Log lines start with [MapView].
 using System;
 using System.Collections.Generic;
@@ -64,6 +66,10 @@ namespace TrackSelect
         GameObject panel, cameraImage, label;
         RectTransform view, image, marker;
         RawImage imageRaw;
+        RawImage linesRaw; Texture2D linesTex; Color32[] linesPx;
+        struct MapLine { public Color32 color; public float[] xy; }
+        MapLine[] lines; long linesTicks; int linesSeq, linesDrawn = -1; Texture2D linesFor;
+        int linesI0, linesJ0, linesI1 = -1, linesJ1 = -1;   // the pixels the lines drawn last cover (box)
         Image markerImage, gtTab, mapTab;
         Text status, accuracyText;
         RectTransform accuracyRect;
@@ -72,7 +78,7 @@ namespace TrackSelect
         const float TextRowShare = 0.135f;
         float textRow = 16f;
         readonly List<Text> tabTexts = new List<Text>();
-        float searchUntil;
+        float searchLeft;
 
         // ---- what is drawn
         Texture2D gtTex, mapTex;
@@ -81,7 +87,10 @@ namespace TrackSelect
         bool gtDirty = true;
         int mapSeqShown = -1; int mapTexW, mapTexH; float mapTexRes, mapTexOx, mapTexOy, mapTexYaw;
         byte[] mapTexCells, mapTexClass;   // the map shown, and per cell 0 off the track, 1 wall, 2 track floor
+        Color32[] mapPx, alignedPx;   // their pixels, kept from one draw to the next (no 16 MB garbage per draw)
         Texture2D alignedTex;   // the map resampled into gtRect (world frame), through the map -> world fit
+        Texture2D alignedFor; Rect alignedRect;   // the Ground Truth texture and area it was drawn for
+        int centreSeq = -1; Rect centreRect; float centreCos, centreSin, centreX, centreY;   // CentreMap's, per map
         int alignedSeq = -1;    // the map it was drawn from
         bool alignedOnTrack;    // drawn through the fit (else centred, as the map lies unaligned)
         float viewCos = 1f, viewSin, viewX, viewY;   // map -> gtRect frame it was drawn with
@@ -109,7 +118,7 @@ namespace TrackSelect
         {
             panel = null; car = null; carSprite = null;
             gtDirty = true;
-            searchUntil = Time.realtimeSinceStartup + 20f;
+            searchLeft = 20f;   // s of running frames (a sim stalled in the background still finds the panel)
         }
 
         void Start()
@@ -153,6 +162,7 @@ namespace TrackSelect
                 c.NoDelay = true;
                 c.ReceiveTimeout = 3000;   // map_view sends a heartbeat every second
                 var r = new BinaryReader(c.GetStream());
+                bool firstMap = true;
                 while (!stopping)
                 {
                     byte kind = r.ReadByte();
@@ -161,11 +171,21 @@ namespace TrackSelect
                     byte[] p = r.ReadBytes(n);
                     if (p.Length < n) throw new EndOfStreamException();
                     long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                    // the map shown already (e.g. sent again on a reconnect): keep it, its texture and its
+                    // placement on the track, instead of rebuilding them all on the main thread
+                    byte[] same = kind == 'M' && n >= 24 ? SameMap(p, n) : null;
                     lock (sync)
                     {
                         if (client != c) return;   // replaced by a newer connection
-                        if (kind == 'M' && n >= 24)
+                        if (same != null && same == mapCells)
                         {
+                            mapTicks = now;
+                            if (firstMap) Debug.Log(Tag + $"map {mapW}x{mapH} unchanged: kept (no rebuild)");
+                            firstMap = false;
+                        }
+                        else if (kind == 'M' && n >= 24)
+                        {
+                            firstMap = false;
                             mapW = (int)BitConverter.ToUInt32(p, 0); mapH = (int)BitConverter.ToUInt32(p, 4);
                             mapRes = BitConverter.ToSingle(p, 8); mapOx = BitConverter.ToSingle(p, 12);
                             mapOy = BitConverter.ToSingle(p, 16); mapYaw = BitConverter.ToSingle(p, 20);
@@ -173,6 +193,22 @@ namespace TrackSelect
                             mapCells = new byte[n - 24];
                             Buffer.BlockCopy(p, 24, mapCells, 0, n - 24);
                             mapSeq++; mapTicks = now;
+                        }
+                        else if (kind == 'L' && n >= 4)
+                        {
+                            int count = (int)BitConverter.ToUInt32(p, 0), at = 4;
+                            var got = new MapLine[count];
+                            for (int li = 0; li < count; li++)
+                            {
+                                if (at + 8 > n) throw new IOException("lines frame too short");
+                                int pts = (int)BitConverter.ToUInt32(p, at + 4);
+                                if (at + 8 + pts * 8 > n) throw new IOException("lines frame too short");
+                                var xy = new float[pts * 2];
+                                Buffer.BlockCopy(p, at + 8, xy, 0, pts * 8);
+                                got[li] = new MapLine { color = new Color32(p[at], p[at + 1], p[at + 2], p[at + 3]), xy = xy };
+                                at += 8 + pts * 8;
+                            }
+                            lines = got; linesTicks = now; linesSeq++;
                         }
                         else if (kind == 'P' && n >= 12)
                         {
@@ -193,6 +229,19 @@ namespace TrackSelect
             }
         }
 
+        // The current map's cells if frame `p` (an 'M' payload of n bytes) holds the very same map, else null.
+        // Compared outside the lock (mapCells is replaced, never written in place).
+        byte[] SameMap(byte[] p, int n)
+        {
+            byte[] cur; int w, h; float res, ox, oy, yaw;
+            lock (sync) { cur = mapCells; w = mapW; h = mapH; res = mapRes; ox = mapOx; oy = mapOy; yaw = mapYaw; }
+            if (cur == null || cur.Length != n - 24 || w != (int)BitConverter.ToUInt32(p, 0) || h != (int)BitConverter.ToUInt32(p, 4)
+                || res != BitConverter.ToSingle(p, 8) || ox != BitConverter.ToSingle(p, 12)
+                || oy != BitConverter.ToSingle(p, 16) || yaw != BitConverter.ToSingle(p, 20)) return null;
+            for (int k = 0; k < cur.Length; k++) if (cur[k] != p[24 + k]) return null;
+            return cur;
+        }
+
         static double Age(long ticks) =>
             ticks == 0 ? double.PositiveInfinity
                        : (System.Diagnostics.Stopwatch.GetTimestamp() - ticks) / (double)System.Diagnostics.Stopwatch.Frequency;
@@ -203,20 +252,26 @@ namespace TrackSelect
         {
             if (panel == null)
             {
-                if (Time.realtimeSinceStartup > searchUntil) return;
+                if (searchLeft <= 0f) return;
+                searchLeft -= Mathf.Min(Time.unscaledDeltaTime, 0.1f);
                 try { Build(); }
-                catch (Exception e) { Debug.LogError(Tag + "UI: " + e); searchUntil = 0f; }
+                catch (Exception e) { Debug.LogError(Tag + "UI: " + e); searchLeft = 0f; }
+                if (panel == null && searchLeft <= 0f) Debug.LogWarning(Tag + "no Front Camera Preview panel in 20 s of running: no map view");
                 if (panel == null) return;
             }
+            long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 if (gtTrack != null && gtTrack != TrackSelector.Current) ClearMapping();
                 if (gtDirty || gtTrack != TrackSelector.Current) DrawGroundTruth();
                 UpdateMapTexture();
+                long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
                 UpdateAccuracy();
+                Perf.MapFitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
                 if (mappingTab) ShowMapping(); else ShowGroundTruth();
             }
             catch (Exception e) { Debug.LogError(Tag + e); gtDirty = false; gtTrack = TrackSelector.Current; }
+            Perf.MapViewTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
         }
 
         void ShowGroundTruth()
@@ -266,6 +321,7 @@ namespace TrackSelect
                 wx += carRearAxle * Mathf.Cos(wyaw); wy += carRearAxle * Mathf.Sin(wyaw);
                 Show(alignedTex, gtRect.width / gtRect.height, gtRect.width, poseAge < double.PositiveInfinity && carSprite != null,
                      (wx - gtRect.xMin) / gtRect.width, (wy - gtRect.yMin) / gtRect.height, wyaw, text, fresh ? 1f : 0.35f);
+                DrawLines(alignedTex, true);
                 return;
             }
             float cx = x + carRearAxle * Mathf.Cos(yaw), cy = y + carRearAxle * Mathf.Sin(yaw);
@@ -274,6 +330,67 @@ namespace TrackSelect
             float u = (c * dx + s * dy) / mapTexRes, v = (-s * dx + c * dy) / mapTexRes;
             Show(mapTex, mapTexW / (float)mapTexH, mapTexW * mapTexRes, poseAge < double.PositiveInfinity && carSprite != null,
                  u / mapTexW, v / mapTexH, yaw - mapTexYaw, text, fresh ? 1f : 0.35f);
+            DrawLines(mapTex, false);
+        }
+
+        // The 'L' lines over the figure just shown: `onTrack` through the view transform, else the grid's. Gone a
+        // second after the last frame, so a stopped stack leaves no stale path.
+        void DrawLines(Texture2D figure, bool onTrack)
+        {
+            MapLine[] draw; int seq; double age;
+            lock (sync) { draw = lines; seq = linesSeq; age = Age(linesTicks); }
+            if (draw == null || figure == null || age > 1.0) return;
+            // a scene reload can leave it without a texture, and a RawImage without one is a solid white rectangle
+            bool lost = linesTex == null || linesRaw.texture != linesTex;
+            if (seq == linesDrawn && figure == linesFor && !lost) { linesRaw.enabled = true; return; }
+            linesDrawn = seq; linesFor = figure;
+            int w = 1024, h = Mathf.Clamp(Mathf.RoundToInt(w * figure.height / (float)figure.width), 16, 2048);
+            if (linesTex == null || linesTex.width != w || linesTex.height != h)
+            {
+                if (linesTex != null) Destroy(linesTex);
+                linesTex = NewTexture(w, h);
+                linesPx = new Color32[w * h];
+                linesI1 = linesJ1 = -1;
+            }
+            // clear only the last lines' box (the rest is still clear), not the whole 1024 x up to 2048
+            for (int j = linesJ0; j <= linesJ1; j++) Array.Clear(linesPx, j * w + linesI0, linesI1 - linesI0 + 1);
+            int bi0 = w, bj0 = h, bi1 = -1, bj1 = -1;
+            float gc = Mathf.Cos(mapTexYaw), gs = Mathf.Sin(mapTexYaw);
+            foreach (var line in draw)
+                for (int k = 0; k + 3 < line.xy.Length; k += 2)
+                {
+                    Vector2 a = LineUV(line.xy[k], line.xy[k + 1], onTrack, gc, gs);
+                    Vector2 b = LineUV(line.xy[k + 2], line.xy[k + 3], onTrack, gc, gs);
+                    int steps = Mathf.Clamp(Mathf.CeilToInt(Mathf.Max(Mathf.Abs(a.x - b.x) * w, Mathf.Abs(a.y - b.y) * h)), 1, 2048);
+                    for (int t = 0; t <= steps; t++)
+                    {
+                        Vector2 q = Vector2.Lerp(a, b, t / (float)steps);
+                        int cx = Mathf.FloorToInt(q.x * w), cy = Mathf.FloorToInt(q.y * h);
+                        if (cx < -1 || cy < -1 || cx > w || cy > h) continue;
+                        bi0 = Math.Min(bi0, Math.Max(cx - 1, 0)); bi1 = Math.Max(bi1, Math.Min(cx + 1, w - 1));
+                        bj0 = Math.Min(bj0, Math.Max(cy - 1, 0)); bj1 = Math.Max(bj1, Math.Min(cy + 1, h - 1));
+                        for (int dy = -1; dy <= 1; dy++)
+                            for (int dx = -1; dx <= 1; dx++)
+                            {
+                                int i = cx + dx, j = cy + dy;
+                                if (i >= 0 && j >= 0 && i < w && j < h) linesPx[j * w + i] = line.color;
+                            }
+                    }
+                }
+            linesI0 = bi0; linesJ0 = bj0; linesI1 = bi1; linesJ1 = bj1;
+            linesTex.SetPixels32(linesPx);
+            linesTex.Apply(false);
+            linesRaw.texture = linesTex;
+            linesRaw.enabled = true;
+        }
+
+        Vector2 LineUV(float x, float y, bool onTrack, float gc, float gs)
+        {
+            if (onTrack)
+                return new Vector2((viewCos * x - viewSin * y + viewX - gtRect.xMin) / gtRect.width,
+                                   (viewSin * x + viewCos * y + viewY - gtRect.yMin) / gtRect.height);
+            float dx = x - mapTexOx, dy = y - mapTexOy;
+            return new Vector2((gc * dx + gs * dy) / mapTexRes / mapTexW, (-gs * dx + gc * dy) / mapTexRes / mapTexH);
         }
 
         // Fit `tex` (width / height = aspect, `across` m wide) into the view, the car at (u, v) of it (0-1).
@@ -282,6 +399,7 @@ namespace TrackSelect
         {
             imageRaw.texture = tex;
             imageRaw.enabled = tex != null;
+            linesRaw.enabled = false;   // DrawLines turns it on, in the Mapping tab with fresh lines
             // the figure at the top of the view, the accuracy line under it, the status line at the bottom
             Rect r = view.rect;
             ScaleText(r);
@@ -363,7 +481,8 @@ namespace TrackSelect
             }
             var sw = System.Diagnostics.Stopwatch.StartNew();
             byte[] cls = TrackFloor(cells, w, h, si, sj, out string how);
-            var tex = new Color32[w * h];
+            if (mapPx == null || mapPx.Length != w * h) mapPx = new Color32[w * h];
+            Color32[] tex = mapPx;
             for (int i = 0; i < tex.Length; i++) tex[i] = cls[i] == 1 ? Wall : cls[i] == 2 ? Free : Unknown;
             mapTex.SetPixels32(tex);
             mapTex.Apply(false);
@@ -487,9 +606,28 @@ namespace TrackSelect
             if (cells == null || cls == null || gtTex == null || res <= 0f) return;
             int w = Math.Min(gtTex.width * 2, 2048), h = Math.Min(gtTex.height * 2, 2048);
             float sx = gtRect.width / w, sy = gtRect.height / h;
-            if (fitted) { viewCos = fitCos; viewSin = fitSin; viewX = fitX; viewY = fitY; }
-            else if (!CentreMap(cells, mw, mh, res, ox, oy, myaw)) return;
+            float vc, vs, vx, vy;
+            if (fitted) { vc = fitCos; vs = fitSin; vx = fitX; vy = fitY; }
+            else
+            {
+                if (centreSeq != seq || centreRect != gtRect)   // the cells' box: once per map, not every 0.5 s
+                {
+                    float c0 = viewCos, s0 = viewSin, x0 = viewX, y0 = viewY;
+                    if (!CentreMap(cells, mw, mh, res, ox, oy, myaw)) return;
+                    centreSeq = seq; centreRect = gtRect;
+                    centreCos = viewCos; centreSin = viewSin; centreX = viewX; centreY = viewY;
+                    viewCos = c0; viewSin = s0; viewX = x0; viewY = y0;
+                }
+                vc = centreCos; vs = centreSin; vx = centreX; vy = centreY;
+            }
+            // the same map, area and placement to within a quarter of a pixel: it would draw the same
+            // picture, so keep it (and the transform it was drawn with, which the car and lines use)
+            if (alignedTex != null && alignedTex.width == w && alignedTex.height == h && alignedSeq == seq
+                && alignedFor == gtTex && alignedRect == gtRect && alignedOnTrack == fitted
+                && Moved(vc, vs, vx, vy) < 0.25f * Mathf.Min(sx, sy)) return;
+            viewCos = vc; viewSin = vs; viewX = vx; viewY = vy;
             alignedOnTrack = fitted;
+            alignedFor = gtTex; alignedRect = gtRect;
             // gtRect frame -> map (inverse view transform), then map -> grid (inverse origin)
             float ic = viewCos, isn = -viewSin, mc = Mathf.Cos(myaw), ms = -Mathf.Sin(myaw);
             if (alignedTex == null || alignedTex.width != w || alignedTex.height != h)
@@ -497,7 +635,8 @@ namespace TrackSelect
                 if (alignedTex != null) Destroy(alignedTex);
                 alignedTex = NewTexture(w, h);
             }
-            var px = new Color32[w * h];
+            if (alignedPx == null || alignedPx.Length != w * h) alignedPx = new Color32[w * h];
+            Color32[] px = alignedPx;
             for (int j = 0; j < h; j++)
                 for (int i = 0; i < w; i++)
                 {
@@ -511,6 +650,23 @@ namespace TrackSelect
             alignedTex.SetPixels32(px);
             alignedTex.Apply(false);
             alignedSeq = seq;
+        }
+
+        // How far (m) the map -> gtRect transform (c, s, x, y) moves any point of gtRect from where the view
+        // transform drawn last puts it (a rigid move: furthest at a corner)
+        float Moved(float c, float s, float x, float y)
+        {
+            float worst = 0f;
+            for (int k = 0; k < 4; k++)
+            {
+                float px = (k & 1) == 0 ? gtRect.xMin : gtRect.xMax, py = (k & 2) == 0 ? gtRect.yMin : gtRect.yMax;
+                // back into the map frame through the view transform drawn last, then out through the new one
+                float dx = px - viewX, dy = py - viewY;
+                float mx = viewCos * dx + viewSin * dy, my = -viewSin * dx + viewCos * dy;
+                float qx = c * mx - s * my + x, qy = s * mx + c * my + y;
+                worst = Mathf.Max(worst, new Vector2(qx - px, qy - py).magnitude);
+            }
+            return worst;
         }
 
         // The view transform for a map not yet placed on the track: its known cells' box centred on gtRect,
@@ -770,7 +926,7 @@ namespace TrackSelect
                 .FirstOrDefault(g => g.name == "Vehicle Front Camera Preview" && g.scene.isLoaded);
             if (p == null) return;   // LateUpdate tries again
             Transform cam = p.transform.Find("Front Camera Preview"), lab = p.transform.Find("Label");
-            if (cam == null || lab == null) { Debug.LogWarning(Tag + "Front Camera Preview layout changed: no map view"); searchUntil = 0f; return; }
+            if (cam == null || lab == null) { Debug.LogWarning(Tag + "Front Camera Preview layout changed: no map view"); searchLeft = 0f; return; }
             cameraImage = cam.gameObject; label = lab.gameObject;
             // a little larger than the camera preview was (anchors 0.07-0.93 x 0.33-0.54 of the HUD), into the
             // gaps beside it and above and below it (the HUD text ends at 0.56, the lap times start at 0.29)
@@ -793,6 +949,10 @@ namespace TrackSelect
             markerImage = marker.gameObject.AddComponent<Image>();
             markerImage.raycastTarget = false;
             imageRaw.raycastTarget = false;
+            var linesRect = NewRect("Map Lines", image, Vector2.zero, Vector2.one);
+            linesRect.anchoredPosition = Vector2.zero; linesRect.sizeDelta = Vector2.zero;
+            linesRaw = linesRect.gameObject.AddComponent<RawImage>();
+            linesRaw.raycastTarget = false; linesRaw.enabled = false;
 
             var srt = NewRect("Map Status", view, new Vector2(0f, 0f), new Vector2(1f, 0f));
             srt.pivot = new Vector2(0.5f, 0f);

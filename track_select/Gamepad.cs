@@ -171,7 +171,7 @@ namespace TrackSelect
         bool Bind()
         {
             if (vc != null) return true;
-            vc = FindObjectOfType<VehicleController>();
+            vc = MultiCar.PrimaryRoot()?.GetComponent<VehicleController>();
             if (vc == null) return false;
             const BindingFlags F = BindingFlags.NonPublic | BindingFlags.Instance;
             Type t = typeof(VehicleController);

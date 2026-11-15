@@ -55,6 +55,7 @@ namespace TrackSelect
         float nextStartLog;
         float mapError = float.NaN, locError = float.NaN;
         float nextScore;
+        byte[] wallsFor; List<Vector2> wallPts = new List<Vector2>();   // MapWalls' last answer, and the map's cells it is for
 
         static double Seconds(long ticks) => ticks / (double)Stopwatch.Frequency;
 
@@ -243,11 +244,14 @@ namespace TrackSelect
         }
 
         // the map's wall cells (occupied, as save_map counts them), their centres in the map frame
+        // Kept per map (its cells array is replaced when the map changes): read-only for the callers.
         List<Vector2> MapWalls()
         {
-            var pts = new List<Vector2>();
             byte[] cells; int w, h; float res, ox, oy, yaw;
             lock (sync) { cells = mapCells; w = mapW; h = mapH; res = mapRes; ox = mapOx; oy = mapOy; yaw = mapYaw; }
+            if (cells != null && cells == wallsFor) return wallPts;
+            var pts = new List<Vector2>();
+            wallsFor = cells; wallPts = pts;
             if (cells == null) return pts;
             float c = Mathf.Cos(yaw), s = Mathf.Sin(yaw);
             for (int j = 0; j < h; j++)
@@ -289,8 +293,9 @@ namespace TrackSelect
             for (int it = 0; it < 60 && dt > 0.002f; it++)
             {
                 bool moved = false;
-                foreach (var (a, x, y) in new[] { (da, 0f, 0f), (-da, 0f, 0f), (0f, dt, 0f), (0f, -dt, 0f), (0f, 0f, dt), (0f, 0f, -dt) })
+                for (int d = 0; d < 6; d++)   // +-turn, +-x, +-y (no array per step: this runs ~60 times per call)
                 {
+                    float a = d == 0 ? da : d == 1 ? -da : 0f, x = d == 2 ? dt : d == 3 ? -dt : 0f, y = d == 4 ? dt : d == 5 ? -dt : 0f;
                     float c0 = Mathf.Cos(th), s0 = Mathf.Sin(th), c1 = Mathf.Cos(th + a), s1 = Mathf.Sin(th + a);
                     float nx = tx + x + (c0 - c1) * m.x - (s0 - s1) * m.y;
                     float ny = ty + y + (s0 - s1) * m.x + (c0 - c1) * m.y;

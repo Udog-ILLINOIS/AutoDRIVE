@@ -75,8 +75,8 @@ namespace TrackSelect
         float runTime, lastFrameRun, enabledAtRun, lastKickRun, lastProbeRun;
         int lastTotal;
         volatile int probe;                 // 0 idle, 1 running, 2 bridge answered, 3 no bridge
-        GameObject mapButton, mapList;
-        float mapSearchUntil;               // realtime until which BuildMapButton keeps looking for the Menu panel
+        GameObject mapButton, mapList, ghostButton;
+        float mapSearchLeft;                // s of running frames BuildMapButton keeps looking for the Menu panel
 
         public static void Init()
         {
@@ -114,10 +114,11 @@ namespace TrackSelect
         void OnSceneLoaded()
         {
             hooked = null;
+            connCache = null; nextConnSearch = 0f;
             expectEnabled = false;   // the new scene's Connect objects start disabled
             if (autoConnect) want = true;
-            mapButton = mapList = null;
-            mapSearchUntil = Time.realtimeSinceStartup + 20f;   // built in Update once the menu is found
+            mapButton = mapList = ghostButton = null;
+            mapSearchLeft = 20f;   // s of running frames: built in Update once the menu is found
         }
 
         // ------------------------------------------------------------ control port
@@ -156,9 +157,40 @@ namespace TrackSelect
             }
         }
 
+        // test tool (ctl hitch): freeze the main thread like a slow frame, once or every ~N s (0.5-1.5 x N)
+        static int hitchMs, hitchOnce;
+        static float hitchEvery, nextHitch;
+        static long hitches;
+
+        static long hitchesAtFrame;
+
+        // The scene's SocketConnection (the Connect button), looked up at most once a second while there is
+        // none: FindObjectOfType(true) walks every object, and Update / Supervise ask every frame.
+        SocketConnection connCache;
+        float nextConnSearch;
+
+        SocketConnection Conn(bool force = false)
+        {
+            if (connCache != null) return connCache;   // Unity's null: also gone with its scene
+            float now = Time.realtimeSinceStartup;
+            if (!force && now < nextConnSearch) return null;
+            nextConnSearch = now + 1f;
+            connCache = FindObjectOfType<SocketConnection>(true);
+            return connCache;
+        }
+
         void Update()
         {
-            if (hooked == null) Hook();
+            Perf.Frame(Time.unscaledDeltaTime, Time.realtimeSinceStartup, hitches != hitchesAtFrame);   // the last frame (ctl hitch sleeps show next frame)
+            hitchesAtFrame = hitches;
+            if (hitchOnce > 0) { int ms = hitchOnce; hitchOnce = 0; hitches++; System.Threading.Thread.Sleep(ms); }
+            else if (hitchEvery > 0f && Time.realtimeSinceStartup >= nextHitch)
+            {
+                hitches++;
+                System.Threading.Thread.Sleep(hitchMs);
+                nextHitch = Time.realtimeSinceStartup + hitchEvery * UnityEngine.Random.Range(0.5f, 1.5f);
+            }
+            if (hooked == null && !MultiCar.Linked) Hook();   // with CarLinks the stock SocketIO stays off
             runTime += Mathf.Min(Time.unscaledDeltaTime, 0.1f);
             int total = Volatile.Read(ref totalMessages);
             if (total != lastTotal) { lastTotal = total; lastFrameRun = runTime; }
@@ -171,11 +203,13 @@ namespace TrackSelect
                 messagesPerS = (messages - rateMessages0) / (now - rateWindowStart);
                 rateWindowStart = now; rateFrames0 = Time.frameCount; rateMessages0 = messages;
             }
-            if (mapButton == null && Time.realtimeSinceStartup < mapSearchUntil)
+            // counted in running frames: a sim stalled in the background for 20 s must still build them
+            if (mapButton == null && mapSearchLeft > 0f)
             {
+                mapSearchLeft -= Mathf.Min(Time.unscaledDeltaTime, 0.1f);
                 try { BuildMapButton(); }
-                catch (Exception e) { Debug.LogError(Tag + "Map button: " + e); mapSearchUntil = 0f; }
-                if (mapButton == null && Time.realtimeSinceStartup >= mapSearchUntil - 0.05f) LogNoMenu();
+                catch (Exception e) { Debug.LogError(Tag + "Map button: " + e); mapSearchLeft = 0f; }
+                if (mapButton == null && mapSearchLeft <= 0f) LogNoMenu();
             }
             while (queue.TryDequeue(out Request req))
             {
@@ -200,6 +234,21 @@ namespace TrackSelect
                     if (w.Length < 2) return Json(false, "error", "usage: track <name>");
                     string chosen = SwitchTrack(string.Join(" ", w.Skip(1)));
                     return chosen == null ? Json(false, "error", "unknown track; see 'tracks'") : Json(true, "track", chosen);
+                // 2+ cars: every car has its own connection (CarLink); these act on all of them
+                case "connect" when MultiCar.Linked:
+                    MultiCar.WantConnected = true;
+                    foreach (Car c in MultiCar.Cars) c.Link.Want = true;
+                    return Json(true, "result", $"{MultiCar.Cars.Count} cars connecting when their bridges answer");
+                case "disconnect" when MultiCar.Linked:
+                    MultiCar.WantConnected = false;
+                    foreach (Car c in MultiCar.Cars) c.Link.Want = false;
+                    return Json(true, "result", $"{MultiCar.Cars.Count} cars disconnected");
+                case "reconnect" when MultiCar.Linked:
+                    foreach (Car c in MultiCar.Cars) { c.Link.Want = true; c.Link.Reconnect("reconnect command"); }
+                    return Json(true, "result", $"{MultiCar.Cars.Count} cars disconnected; each connects again when its bridge answers");
+                case "kick" when MultiCar.Linked:
+                    foreach (Car c in MultiCar.Cars) c.Link.Kick();
+                    return Json(true, "result", "sent one telemetry frame per car");
                 case "connect": return Json(true, "result", Connect(w.Length > 1 ? w[1] : null, w.Length > 2 ? w[2] : null));
                 case "disconnect": return Json(true, "result", Disconnect());
                 case "reconnect":
@@ -295,6 +344,56 @@ namespace TrackSelect
                         return Json(true, "bounds", sb.ToString());
                     }
                 case "livery": return Json(true, "result", Livery.Apply());
+                case "park": case "unpark":   // park|unpark <car>: stop it in place (ignores its bridge) or let it go
+                    {
+                        Car c = w.Length > 1 ? MultiCar.Cars.FirstOrDefault(x => x.Index.ToString() == w[1]) : null;
+                        if (c == null) return Json(false, "error", "usage: park|unpark <car>");
+                        return Json(true, "result", MultiCar.Park(c, cmd == "park"));
+                    }
+                case "grid":   // cars 2..'s reset poses back to the grid behind car 1's start (after a ghost race)
+                    MultiCar.GridStarts(w.Length > 1 && w[1] == "move");
+                    return Json(true, "result", "grid start poses restored" + (w.Length > 1 && w[1] == "move" ? ", cars moved there" : ""));
+                case "hold":   // hold [on|off]: every car at zero throttle whatever its bridge asks (off: let go, no lap reset)
+                    MultiCar.Held = w.Length < 2 || w[1].ToLower() == "on" || w[1] == "1";
+                    return Json(true, "result", MultiCar.Held ? "cars held (zero throttle) until start or hold off" : "cars not held");
+                case "start": return Json(true, "result", MultiCar.Start());
+                case "hitch":   // hitch <ms> [every_s] | hitch off: freeze the sim's main thread (frame hitch test)
+                    {
+                        if (w.Length < 2) return Json(true, "result", $"{hitchMs} ms every ~{hitchEvery} s, {hitches} so far");
+                        if (w[1] == "off") { hitchEvery = 0f; return Json(true, "result", $"hitches off ({hitches} so far)"); }
+                        if (!int.TryParse(w[1], out int ms) || ms <= 0 || ms > 2000) return Json(false, "error", "usage: hitch <ms 1-2000> [every_s] | hitch off");
+                        float every = 0f;
+                        if (w.Length > 2) float.TryParse(w[2], NumberStyles.Float, CultureInfo.InvariantCulture, out every);
+                        if (every > 0f) { hitchMs = ms; hitchEvery = every; nextHitch = Time.realtimeSinceStartup + every; hitches = 0; }
+                        else hitchOnce = ms;
+                        return Json(true, "result", every > 0f ? $"{ms} ms hitch every ~{every} s" : $"one {ms} ms hitch");
+                    }   // release every car, lap timers restarted
+                case "ghost":   // ghost on|off: no contact + translucent + unseen by the lidars, or the opposite
+                    if (w.Length < 2) return Json(true, "result", MultiCar.Ghost ? "on" : "off");
+                    { string r = MultiCar.SetGhost(w[1].ToLower() == "on" || w[1] == "1"); UpdateGhostLabel(); return Json(true, "result", r); }
+                case "lidarcars":   // lidarcars on|off: the lidars see the other cars or not (multi-car sim)
+                    if (w.Length < 2) return Json(true, "result", MultiCar.LidarSeesCars ? "on" : "off");
+                    { string r = MultiCar.SetLidarSeesCars(w[1].ToLower() == "on" || w[1] == "1"); UpdateGhostLabel(); return Json(true, "result", r); }
+                case "ghostlook": return Json(true, "result", MultiCar.GhostLook(w));   // ghostlook [alpha] [lit|unlit] [r g b]
+                case "cars": return MultiCar.Json();   // every car: pose (ROS world), port, connection, frames/s
+                case "contact":   // contact on|off: cars collide, or are ghosts (seen by the lidars only)
+                    if (w.Length < 2) return Json(true, "result", MultiCar.Contact ? "on" : "off");
+                    { string r = MultiCar.SetContact(w[1].ToLower() == "on" || w[1] == "1"); UpdateGhostLabel(); return Json(true, "result", r); }
+                case "place":   // place <car> <x> <y> [yaw]: ROS world pose, also the car's reset pose
+                    {
+                        if (w.Length < 4) return Json(false, "error", "usage: place <car> <x> <y> [yaw]");
+                        var ci = CultureInfo.InvariantCulture;
+                        string r = MultiCar.Place(int.Parse(w[1]), float.Parse(w[2], ci), float.Parse(w[3], ci),
+                                                  w.Length > 4 ? float.Parse(w[4], ci) : (float?)null);
+                        return r == null ? Json(false, "error", "no car " + w[1]) : Json(true, "result", r);
+                    }
+                case "resetcar":   // resetcar <car>: that car to its start pose, lap timer and encoders restarted
+                    {
+                        Car c = w.Length > 1 ? MultiCar.Cars.FirstOrDefault(x => x.Index.ToString() == w[1]) : null;
+                        if (c == null) return Json(false, "error", "usage: resetcar <car>");
+                        MultiCar.ResetCar(c);
+                        return Json(true, "result", "car " + c.Index + " reset");
+                    }
                 case "obstacle":   // obstacle <x> <y> [size] | obstacle clear: a box at ROS world x, y
                     {
                         if (w.Length == 2 && w[1].ToLower() == "clear") return Json(true, "result", ClearObstacles());
@@ -371,21 +470,27 @@ namespace TrackSelect
 
         string Status()
         {
-            SocketConnection conn = FindObjectOfType<SocketConnection>(true);
+            SocketConnection conn = Conn(true);
             SocketIOComponent sio = conn == null ? null : conn.SocketIO.GetComponent<SocketIOComponent>();
-            VehicleController vc = FindObjectOfType<VehicleController>(true);
+            VehicleController vc = MultiCar.PrimaryRoot()?.GetComponent<VehicleController>();
             double age = lastFrameTicks == 0 ? -1 : (Stopwatch.GetTimestamp() - lastFrameTicks) / (double)Stopwatch.Frequency;
             var sb = new StringBuilder("{\"ok\":true");
             sb.Append(",\"want_connected\":").Append(want ? "true" : "false");
             sb.Append(",\"connect_enabled\":").Append(conn != null && conn.SocketIO.activeSelf ? "true" : "false");
-            sb.Append(",\"connected\":").Append(sio != null && sio.IsConnected ? "true" : "false");
+            Car one = MultiCar.Linked ? MultiCar.Primary : null;   // car 1's CarLink (MultiCar.UseCarLink)
+            bool connected = one != null && one.Link != null ? one.Link.Connected : sio != null && sio.IsConnected;
+            sb.Append(",\"connected\":").Append(connected ? "true" : "false");
             sb.Append(",\"bridge\":").Append(Str(sio == null ? null : sio.IPAddress + ":" + sio.PortNumber));
             sb.Append(",\"fps\":").Append(fps.ToString("0", System.Globalization.CultureInfo.InvariantCulture));
-            sb.Append(",\"frames_per_s\":").Append(messagesPerS.ToString("0", System.Globalization.CultureInfo.InvariantCulture));
+            float mps = messagesPerS;
+            if (one != null && one.Link != null) { mps = one.Link.FramesPerS; age = one.Link.LastFrameAge; }   // CarLink's own counters
+            sb.Append(",\"frames_per_s\":").Append(mps.ToString("0", System.Globalization.CultureInfo.InvariantCulture));
             sb.Append(",\"last_frame_s\":").Append(age < 0 ? "null" : age.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
             sb.Append(",\"track\":").Append(Str(TrackSelector.Current));
             sb.Append(",\"mode\":").Append(Str(vc == null ? null : vc.DrivingMode == 1 ? "Autonomous" : "Manual"));
             sb.Append(",\"gamepad\":").Append(Str(Gamepad.Status()));
+            sb.Append(",\"slow_frames\":").Append(Perf.SlowFrames.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"last_slow_frame_ms\":").Append(float.IsNaN(Perf.LastSlowMs) ? "null" : Perf.LastSlowMs.ToString("0", CultureInfo.InvariantCulture));
             return sb.Append('}').ToString();
         }
 
@@ -407,8 +512,22 @@ namespace TrackSelect
         // The Connect button keeps working: pressing it sets `want` to what it now shows.
         void Supervise()
         {
-            SocketConnection conn = FindObjectOfType<SocketConnection>(true);
+            SocketConnection conn = Conn();
             if (conn == null) return;
+            if (MultiCar.Linked)   // every car has its own CarLink (car 1 on this port): keep the sim's own off
+            {
+                if (conn.SocketIO.activeSelf)
+                {
+                    // the Connect button was pressed (it turns the stock Socket on): connect the CarLinks instead
+                    if (expectEnabled == false && runTime > 1f)
+                    {
+                        MultiCar.WantConnected = true;
+                        foreach (Car c in MultiCar.Cars) if (c.Link != null) c.Link.Want = true;
+                    }
+                    SetConnection(conn, false); expectEnabled = false;
+                }
+                return;
+            }
             bool enabled = conn.SocketIO.activeSelf;
             if (enabled != expectEnabled)   // the Connect button was pressed
             {
@@ -456,12 +575,13 @@ namespace TrackSelect
 
         void Disable(string reason)
         {
-            SocketConnection conn = FindObjectOfType<SocketConnection>(true);
+            SocketConnection conn = Conn(true);
             if (conn == null || !conn.SocketIO.activeSelf) return;
             SetConnection(conn, false);
             expectEnabled = false;
             // the sim keeps applying the last command it got: stop the car instead of driving on blind
-            foreach (VehicleController v in FindObjectsOfType<VehicleController>(true)) { v.CurrentThrottle = 0f; v.CurrentSteeringAngle = 0f; }
+            VehicleController v1 = MultiCar.PrimaryRoot()?.GetComponent<VehicleController>();   // car 1's bridge: cars 2.. have their own (CarLink)
+            if (v1 != null) { v1.CurrentThrottle = 0f; v1.CurrentSteeringAngle = 0f; }
             foreach (AutomobileController a in FindObjectsOfType<AutomobileController>(true)) { a.CurrentThrottle = 0f; a.CurrentSteeringAngle = 0f; }
             foreach (TwistController t in FindObjectsOfType<TwistController>(true)) { t.vSetpoint = 0f; t.wSetpoint = 0f; }
             lastProbeRun = runTime;   // next probe in 1 s
@@ -503,7 +623,7 @@ namespace TrackSelect
 
         string Connect(string ip, string port)
         {
-            SocketConnection conn = FindObjectOfType<SocketConnection>(true);
+            SocketConnection conn = Conn(true);
             if (conn == null) return "no Connection object in this scene";
             SocketIOComponent sio = conn.SocketIO.GetComponent<SocketIOComponent>();
             if (sio != null && ip != null) sio.IPAddress = ip;         // read in OnEnable, when connecting
@@ -516,7 +636,7 @@ namespace TrackSelect
         string Disconnect()
         {
             want = false;
-            SocketConnection conn = FindObjectOfType<SocketConnection>(true);
+            SocketConnection conn = Conn(true);
             if (conn == null) return "no Connection object in this scene";
             if (!conn.SocketIO.activeSelf) return "already disconnected";
             Disable("disconnect command");
@@ -536,7 +656,7 @@ namespace TrackSelect
 
         void Hook()
         {
-            SocketConnection conn = FindObjectOfType<SocketConnection>(true);
+            SocketConnection conn = Conn();
             SocketIOComponent sio = conn == null ? null : conn.SocketIO.GetComponent<SocketIOComponent>();
             // its handler table is made in Awake, which runs when the object is first enabled
             if (sio == null || !conn.SocketIO.activeInHierarchy) return;
@@ -579,7 +699,7 @@ namespace TrackSelect
         // evenly over the same height. The track list opens to the right of the panel.
         void BuildMapButton()
         {
-            SocketConnection conn = FindObjectOfType<SocketConnection>(true);
+            SocketConnection conn = Conn();
             if (conn == null || conn.transform.parent == null) return;   // Update tries again
             var menu = (RectTransform)conn.transform.parent;
             RectTransform[] rows = menu.Cast<Transform>().Where(t => t.GetComponent<Button>() != null)
@@ -592,6 +712,21 @@ namespace TrackSelect
             map.SetSiblingIndex(camera.GetSiblingIndex() + 1);
             var order = rows.ToList();
             order.Insert(order.IndexOf(camera) + 1, map);
+            if (MultiCar.Count > 1)   // only with more than one car: the Ghost toggle (MultiCar.SetGhost:
+            {                         // contact, look and lidar together; ctl ghost) as the panel's last row
+                ghostButton = CleanClone(camera.gameObject, menu, "Ghost");
+                var gl = (RectTransform)ghostButton.transform;
+                gl.SetSiblingIndex(rows.Last().GetSiblingIndex() + 1);
+                order.Add(gl);
+                Image glIcon = ghostButton.GetComponent<Image>();
+                if (glIcon != null) glIcon.sprite = GhostIcon();
+                ghostButton.GetComponent<Button>().onClick.AddListener(() =>
+                {
+                    Debug.Log(Tag + MultiCar.SetGhost(!MultiCar.Ghost));
+                    UpdateGhostLabel();
+                });
+                UpdateGhostLabel();
+            }
             float top = rows.First().anchorMax.y, bottom = rows.Last().anchorMin.y, step = (top - bottom) / order.Count;
             for (int i = 0; i < order.Count; i++)
             {
@@ -647,7 +782,7 @@ namespace TrackSelect
         void LogNoMenu()
         {
             Debug.LogWarning(Tag + "no Connection button (Menu panel) found in 20 s: no Map button");
-            mapSearchUntil = 0f;
+            mapSearchLeft = 0f;
         }
 
         void ToggleMapList()
@@ -715,6 +850,43 @@ namespace TrackSelect
             tex.Apply();
             mapIcon = Sprite.Create(tex, new Rect(0, 0, n, n), new Vector2(0.5f, 0.5f), 100f);
             return mapIcon;
+        }
+
+        void UpdateGhostLabel()
+        {
+            if (ghostButton != null) SetLabel(ghostButton, "Ghost: " + (MultiCar.Ghost ? "On" : "Off"));   // MultiCar.SetGhost
+        }
+
+        static Sprite ghostIcon;
+        // a lidar: a ring with a dot in the middle and four short rays
+        static Sprite GhostIcon()
+        {
+            if (ghostIcon != null) return ghostIcon;
+            const int n = 128;
+            var tex = new Texture2D(n, n, TextureFormat.RGBA32, false);
+            var px = new Color32[n * n];
+            var c = new Vector2(64, 64);
+            var rays = new System.Collections.Generic.List<(Vector2, Vector2)>();
+            for (int i = 0; i < 4; i++)
+            {
+                float a = Mathf.PI / 4 + i * Mathf.PI / 2;
+                var d = new Vector2(Mathf.Cos(a), Mathf.Sin(a));
+                rays.Add((c + d * 38f, c + d * 58f));
+            }
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < n; x++)
+                {
+                    var p = new Vector2(x + 0.5f, y + 0.5f);
+                    float r = Vector2.Distance(p, c);
+                    float d = Mathf.Min(Mathf.Abs(r - 26f), Mathf.Max(0f, r - 5f));   // ring, filled dot
+                    d = Mathf.Min(d, rays.Min(s => DistanceToSegment(p, s.Item1, s.Item2)));
+                    byte al = (byte)(255f * Mathf.Clamp01(4.5f + 0.5f - d));
+                    px[y * n + x] = new Color32(255, 255, 255, al);
+                }
+            tex.SetPixels32(px);
+            tex.Apply();
+            ghostIcon = Sprite.Create(tex, new Rect(0, 0, n, n), new Vector2(0.5f, 0.5f), 100f);
+            return ghostIcon;
         }
 
         static float DistanceToSegment(Vector2 p, Vector2 a, Vector2 b)
